@@ -15,6 +15,11 @@ services:
       timeout: 5s
       retries: 5
 
+  clamav:
+    image: clamav/clamav:stable
+    ports:
+      - "3310:3310"
+
   api:
     build: .
     command: >
@@ -22,6 +27,7 @@ services:
     environment:
       NODE_ENV: development
       DATABASE_URL: postgresql://hiresettle:password@postgres:5432/hiresettle_db
+      CLAMAV_HOST: clamav
     env_file:
       - .env
     ports:

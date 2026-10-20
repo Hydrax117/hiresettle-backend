@@ -74,6 +74,11 @@ export const envValidationSchema = Joi.object({
   S3_PRESIGNED_URL_EXPIRY: Joi.number().integer().min(60).max(604800).default(3600),
   S3_CLEANUP_GRACE_PERIOD_HOURS: Joi.number().integer().min(1).max(168).default(24),
 
+  // Malware scanning of uploaded evidence (#471) — clamd TCP endpoint
+  CLAMAV_HOST: Joi.string().default('localhost'),
+  CLAMAV_PORT: Joi.number().integer().min(1).max(65535).default(3310),
+  CLAMAV_TIMEOUT_MS: Joi.number().integer().min(1000).max(300000).default(30000),
+
   // Stellar circuit breaker
   STELLAR_BREAKER_TIMEOUT: Joi.number().integer().min(1000).max(60000).default(10000),
   STELLAR_BREAKER_ERROR_THRESHOLD: Joi.number().integer().min(1).max(100).default(50),

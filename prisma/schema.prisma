@@ -70,6 +70,14 @@ enum NotificationType {
   WATCHER_ADDED
   UNMATCHED_PAYMENT_ALERT
   DISPUTE_MESSAGE_CREATED
+  FILE_QUARANTINED
+}
+
+// Malware scan state of an uploaded file (#471). Files are only served once CLEAN.
+enum FileScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
 }
 
 enum UserRole {
@@ -184,6 +192,7 @@ model Plan {
   id                   String   @id
   name                 String
   maxActiveEngagements Int
+  platformFeeBps       Int      @default(0) // platform fee charged on engagement value, in basis points (#375)
   createdAt            DateTime @default(now())
 
   users User[]
@@ -370,6 +379,10 @@ model Engagement {
   candidateStartDate DateTime?
   candidateRole     String?
   placedAt          DateTime?         // when candidate was placed
+  targetStartDate   DateTime?         // hiring deadline for the role (#470)
+  // Asset/USD rate snapshotted when escrow funding is confirmed, so fiat reports stay stable (#469)
+  fundingRateUsd    Float?
+  fundingRateAt     DateTime?
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
 
@@ -393,6 +406,7 @@ model Engagement {
   @@index([recruiterAddress])
   @@index([status, createdAt])
   @@index([archivedAt])
+  @@index([targetStartDate])
   @@map("engagements")
 }
 
@@ -838,6 +852,8 @@ model DisputeEvidence {
   mimeType    String
   s3Path      String    // path in S3 bucket
   s3Url       String?   // presigned URL (optional, can be generated on the fly)
+  scanStatus  FileScanStatus @default(PENDING) // malware scan result (#471)
+  scannedAt   DateTime?
   uploadedAt  DateTime  @default(now())
 
   milestone   Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
@@ -845,6 +861,7 @@ model DisputeEvidence {
 
   @@index([milestoneId])
   @@index([uploadedBy])
+  @@index([scanStatus])
   @@map("dispute_evidence")
 }
 
@@ -1168,6 +1185,8 @@ model DisputeMessage {
   attachmentName     String?
   attachmentSize     Int?      // bytes
   attachmentMimeType String?
+  attachmentScanStatus FileScanStatus? // null when there is no attachment (#471)
+  attachmentScannedAt  DateTime?
   createdAt          DateTime  @default(now())
 
   dispute Dispute @relation(fields: [disputeId], references: [id], onDelete: Cascade)
@@ -1175,6 +1194,7 @@ model DisputeMessage {
 
   @@index([disputeId, createdAt])
   @@index([authorId])
+  @@index([attachmentScanStatus])
   @@map("dispute_messages")
 }
 

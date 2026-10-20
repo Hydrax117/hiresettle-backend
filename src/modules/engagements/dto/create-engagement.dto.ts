@@ -27,6 +27,27 @@ export function MilestonesSum100(validationOptions?: ValidationOptions) {
   };
 }
 
+/** Rejects dates that are not strictly in the future (#470). */
+export function IsFutureDate(validationOptions?: ValidationOptions) {
+  return function (object: Object, propertyName: string) {
+    registerDecorator({
+      name: 'isFutureDate',
+      target: object.constructor,
+      propertyName: propertyName,
+      options: validationOptions,
+      validator: {
+        validate(value: any) {
+          const time = new Date(value).getTime();
+          return !Number.isNaN(time) && time > Date.now();
+        },
+        defaultMessage(args: ValidationArguments) {
+          return `${args.property} must be a date in the future`;
+        },
+      },
+    });
+  };
+}
+
 export class MilestoneInputDto {
   @ApiProperty({ example: 'Candidate Placed' })
   @IsString() @IsNotEmpty()
@@ -94,6 +115,16 @@ export class CreateEngagementDto {
   @ApiProperty({ required: false, example: 'Remote' })
   @IsOptional() @IsString()
   location?: string;
+
+  @ApiProperty({
+    required: false,
+    example: '2026-12-01',
+    description: 'ISO date — target start date (hiring deadline) for the role. Must be in the future (#470).',
+  })
+  @IsOptional()
+  @IsDateString()
+  @IsFutureDate()
+  targetStartDate?: string;
 
   @ApiProperty({ type: [MilestoneInputDto], required: false })
   @IsOptional() @IsArray()
