@@ -155,7 +155,7 @@ export class MilestonesService {
     });
 
     return this.prisma.$transaction(async (tx) => {
-      const created = [];
+      const created: Awaited<ReturnType<typeof tx.milestone.create>>[] = [];
       for (const data of milestoneData) {
         created.push(await tx.milestone.create({ data }));
       }
@@ -469,7 +469,7 @@ export class MilestonesService {
   }
 
   async bulkResolveDisputes(disputeIds: string[], resolution: string) {
-    const results = [];
+    const results: Array<{ disputeId: string; success: boolean; data?: any; error?: string }> = [];
 
     for (const disputeId of disputeIds) {
       try {
@@ -515,7 +515,7 @@ export class MilestonesService {
     reason: string,
     adminId: string,
   ) {
-    const results = [];
+    const results: Array<{ milestoneId: string; success: boolean; data?: any; error?: string }> = [];
 
     for (const milestoneId of milestoneIds) {
       try {

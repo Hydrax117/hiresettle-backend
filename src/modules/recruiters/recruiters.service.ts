@@ -1,14 +1,16 @@
 import { Injectable, NotFoundException, Inject } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { EngagementStatus, MilestoneStatus, MilestoneKind, UserRole } from '@prisma/client';
 import { SearchRecruitersDto } from './dto/search-recruiters.dto';
 import { cursorPage } from '../../common/pagination/cursor-pagination';
+import { RecruiterReviewsService } from './recruiter-reviews.service';
 
 interface CurrentUser {
   id: string;
-  stellarAddress?: string;
+  stellarAddress?: string | null;
   role: string;
 }
 
@@ -21,7 +23,7 @@ export class RecruitersService {
   ) {}
 
   async listRecruiters({ search, page = 1, limit = 20, cursor }: SearchRecruitersDto = {}) {
-    const where: Parameters<typeof this.prisma.user.findMany>[0]['where'] = {
+    const where: Prisma.UserWhereInput = {
       role: UserRole.RECRUITER,
       deactivatedAt: null,
       ...(search && search.trim()

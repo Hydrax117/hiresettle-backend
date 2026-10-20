@@ -1,22 +1,14 @@
 import {
   Injectable, NotFoundException, ConflictException, BadRequestException, Logger, ForbiddenException,
 } from '@nestjs/common';
-import { User, EngagementStatus, MilestoneKind, NotificationType, UserRole } from '@prisma/client';
+import { User, EngagementStatus, MilestoneKind, MilestoneStatus, NotificationType, UserRole } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { CreateEngagementDto } from './dto/create-engagement.dto';
 import { EngagementSummaryDto } from './dto/engagement-summary.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from './audit-log.service';
-import { EngagementNotesService } from './engagement-notes.service';
-import { EngagementImportService } from './engagement-import.service';
-import { EngagementCandidateDetailsService } from './engagement-candidate-details.service';
 import { cursorPage } from '../../common/pagination/cursor-pagination';
-
-// String-literal constants for Prisma enums that may not resolve during Jest runs
-// (the generated client is mocked in unit tests).
-const MILESTONE_STATUS_LOCKED = 'LOCKED' as const;
-const MILESTONE_STATUS_PENDING = 'PENDING' as const;
 
 const ENGAGEMENT_SORTABLE_FIELDS: Record<string, string> = {
   createdAt: 'createdAt',
@@ -35,9 +27,6 @@ export class EngagementsService {
     private readonly stellar: StellarService,
     private readonly notifications: NotificationsService,
     private readonly auditLog: AuditLogService,
-    private readonly notesService: EngagementNotesService,
-    private readonly importService: EngagementImportService,
-    private readonly candidateDetailsService: EngagementCandidateDetailsService,
   ) {}
 
   // ----------------------------------------------------------
@@ -53,40 +42,9 @@ export class EngagementsService {
       throw new ConflictException(`Engagement ${dto.engagementId} already exists`);
     }
 
-    // Plan limit: check active engagement count against company's plan
-    const companyWithPlan = await this.prisma.user.findUnique({
-      where: { id: user.id },
-      select: { plan: { select: { maxActiveEngagements: true } } },
-    });
-    if (companyWithPlan?.plan) {
-      const activeCount = await this.prisma.engagement.count({
-        where: { companyId: user.id, status: { in: ['ACTIVE', 'PENDING_ACCEPTANCE'] } },
-      });
-      if (activeCount >= companyWithPlan.plan.maxActiveEngagements) {
-        throw new BadRequestException(
-          `Plan limit reached: your plan allows at most ${companyWithPlan.plan.maxActiveEngagements} active engagements`,
-        );
-      }
-    }
-
     // Validate token is allowed
     if (!this.stellar.isTokenAllowed(dto.tokenAddress)) {
       throw new BadRequestException(`Token ${dto.tokenAddress} is not allowed`);
-    }
-
-    // Validate customFields keys against the company's allow-list
-    if (dto.customFields && Object.keys(dto.customFields).length > 0) {
-      const companyUser = await this.prisma.user.findUnique({
-        where: { id: user.id },
-        select: { allowedCustomFields: true },
-      });
-      const allowed = companyUser?.allowedCustomFields ?? [];
-      const unknown = Object.keys(dto.customFields).filter((k) => !allowed.includes(k));
-      if (unknown.length > 0) {
-        throw new BadRequestException(
-          `Unknown custom field key(s): ${unknown.join(', ')}. Configure allowed keys via PUT /users/me/custom-fields-config`,
-        );
-      }
     }
 
     // Load template if provided — pin to the specific version that is current as of
@@ -102,12 +60,6 @@ export class EngagementsService {
 
       templateVersion = await this.prisma.engagementTemplateVersion.findUnique({
         where: { templateId_version: { templateId: template.id, version: template.currentVersion } },
-      });
-
-      // Increment template usage stats (#265)
-      await this.prisma.engagementTemplate.update({
-        where: { id: template.id },
-        data: { usageCount: { increment: 1 }, lastUsedAt: new Date() },
       });
     }
 
@@ -142,7 +94,7 @@ export class EngagementsService {
         kind: m.kind as MilestoneKind,
         paymentPercent: m.paymentPercent,
         retentionDays,
-        status: isRetention ? MILESTONE_STATUS_LOCKED : MILESTONE_STATUS_PENDING,
+        status: isRetention ? MilestoneStatus.LOCKED : MilestoneStatus.PENDING,
       };
     });
 
@@ -159,8 +111,7 @@ export class EngagementsService {
         jobDescription: mergedData.jobDescription,
         salaryRange: mergedData.salaryRange,
         location: mergedData.location,
-        customFields: mergedData.customFields ?? undefined,
-        status: 'PENDING_ACCEPTANCE',
+        status: EngagementStatus.PENDING_ACCEPTANCE,
         templateVersionId: templateVersion?.id,
         milestones: { create: milestoneData },
       },
@@ -171,7 +122,7 @@ export class EngagementsService {
 
     await this.notifications.notifyUser(
       mergedData.recruiterAddress,
-      'ENGAGEMENT_CREATED',
+      NotificationType.ENGAGEMENT_CREATED,
       `New engagement invite: ${mergedData.jobTitle}`,
       `You have a new engagement invite for "${mergedData.jobTitle}". Please accept or decline.`,
       { engagementId: engagement.id },
@@ -192,7 +143,7 @@ export class EngagementsService {
   ) {
     const where = {
       recruiterAddress: recruiterStellarAddress,
-      status: 'PENDING_ACCEPTANCE',
+      status: EngagementStatus.PENDING_ACCEPTANCE,
     };
 
     if (cursor) {
@@ -238,7 +189,7 @@ export class EngagementsService {
     if (engagement.recruiterAddress !== user.stellarAddress) {
       throw new ForbiddenException('You are not the invited recruiter for this engagement');
     }
-    if (engagement.status !== 'PENDING_ACCEPTANCE') {
+    if (engagement.status !== EngagementStatus.PENDING_ACCEPTANCE) {
       throw new ConflictException(`Engagement is not pending acceptance (current status: ${engagement.status})`);
     }
 
@@ -254,7 +205,7 @@ export class EngagementsService {
       );
     }
 
-    const retentionMilestones = engagement.milestones.filter((m) => m.kind === 'RETENTION');
+    const retentionMilestones = engagement.milestones.filter((m) => m.kind === MilestoneKind.RETENTION);
     const { txHash, ledger: createdLedger } = await this.stellar.submitCreateEngagement({
       engagementId: engagement.id,
       companyAddress: engagement.companyAddress,
@@ -266,7 +217,7 @@ export class EngagementsService {
         name: m.name,
         paymentPercent: m.paymentPercent,
         kind: m.kind,
-        retentionDays: m.kind === 'RETENTION'
+        retentionDays: m.kind === MilestoneKind.RETENTION
           ? retentionMilestones.indexOf(m) >= 0 && m.retentionDays != null
             ? m.retentionDays
             : undefined
@@ -276,60 +227,42 @@ export class EngagementsService {
 
     const currentLedger = await this.stellar.getLatestLedger();
 
-    // 3. Build milestone data with unlock estimates
+    // 3. Build milestone data with unlock estimates for retention milestones
     let retentionIdx = 0;
-    const milestoneData = engagement.milestones.map((m: any, index: number) => {
-      const isRetention = m.kind === 'RETENTION';
-      const retentionDays = isRetention ? (engagement.milestones.filter((x: any) => x.kind === 'RETENTION')[retentionIdx++]?.retentionDays ?? null) : null;
-      const validAfterLedger = isRetention && retentionDays
-        ? createdLedger + (retentionDays * 17_280)
-        : null;
-      const unlockEstimatedAt = validAfterLedger
-        ? this.stellar.ledgerToDateTime(validAfterLedger, currentLedger)
-        : null;
+    const milestoneUpdates = engagement.milestones
+      .filter((m) => m.kind === MilestoneKind.RETENTION && m.retentionDays)
+      .map((m) => {
+        const retentionDays = m.retentionDays!;
+        const validAfterLedger = createdLedger + retentionDays * 17_280;
+        const unlockEstimatedAt = this.stellar.ledgerToDateTime(validAfterLedger, currentLedger);
+        return { m, validAfterLedger, unlockEstimatedAt };
+      });
 
-      return {
-        milestoneIndex: index,
-        name: m.name,
-        kind: m.kind as MilestoneKind,
-        paymentPercent: m.paymentPercent,
-        retentionDays,
-        validAfterLedger: validAfterLedger ?? null,
-        unlockEstimatedAt,
-        placementDueAt: m.kind === 'PLACEMENT' && m.placementDueAt ? new Date(m.placementDueAt) : null,
-        status: isRetention ? MILESTONE_STATUS_LOCKED : MILESTONE_STATUS_PENDING,
-      };
-    });
-
-    // 4. Persist engagement + milestones + retention schedules atomically
-    const updated = await this.prisma.$transaction(async (tx) => {
+    // 4. Persist on-chain data and retention schedules atomically
+    const refreshedEngagement = await this.prisma.$transaction(async (tx) => {
       await tx.engagement.update({
         where: { id: engagementId },
         data: {
-          status: 'ACTIVE',
           txHash,
           createdLedger,
+          status: EngagementStatus.ACTIVE,
         },
       });
 
-      for (const m of engagement.milestones) {
-        if (m.kind === 'RETENTION' && m.retentionDays) {
-          const validAfterLedger = createdLedger + m.retentionDays * 17_280;
-          const unlockEstimatedAt = this.stellar.ledgerToDateTime(validAfterLedger, currentLedger);
-          await tx.milestone.update({
-            where: { id: m.id },
-            data: { validAfterLedger, unlockEstimatedAt },
-          });
-          await tx.retentionSchedule.create({
-            data: {
-              engagementId,
-              milestoneIndex: m.milestoneIndex,
-              validAfterLedger,
-              unlockAt: unlockEstimatedAt,
-              notifyAt: new Date(unlockEstimatedAt.getTime() - 3 * 24 * 60 * 60 * 1000),
-            },
-          });
-        }
+      for (const { m, validAfterLedger, unlockEstimatedAt } of milestoneUpdates) {
+        await tx.milestone.update({
+          where: { id: m.id },
+          data: { validAfterLedger, unlockEstimatedAt },
+        });
+        await tx.retentionSchedule.create({
+          data: {
+            engagementId,
+            milestoneIndex: m.milestoneIndex,
+            validAfterLedger,
+            unlockAt: unlockEstimatedAt,
+            notifyAt: new Date(unlockEstimatedAt.getTime() - 3 * 24 * 60 * 60 * 1000),
+          },
+        });
       }
 
       return tx.engagement.findUnique({
@@ -343,14 +276,14 @@ export class EngagementsService {
     await Promise.allSettled([
       this.notifications.notifyUser(
         engagement.companyAddress,
-        'ENGAGEMENT_CREATED',
+        NotificationType.ENGAGEMENT_CREATED,
         `Engagement accepted: ${engagement.jobTitle}`,
         `The recruiter has accepted the engagement "${engagement.jobTitle}" (${engagementId}). On-chain funding is in progress.`,
         { engagementId, txHash },
       ),
     ]);
 
-    return this.serialize(updated);
+    return this.serialize(refreshedEngagement!);
   }
 
   async declineInvite(engagementId: string, user: User) {
@@ -362,13 +295,13 @@ export class EngagementsService {
     if (engagement.recruiterAddress !== user.stellarAddress) {
       throw new ForbiddenException('You are not the invited recruiter for this engagement');
     }
-    if (engagement.status !== 'PENDING_ACCEPTANCE') {
+    if (engagement.status !== EngagementStatus.PENDING_ACCEPTANCE) {
       throw new ConflictException(`Engagement is not pending acceptance (current status: ${engagement.status})`);
     }
 
     const updated = await this.prisma.engagement.update({
       where: { id: engagementId },
-      data: { status: 'CANCELLED' },
+      data: { status: EngagementStatus.CANCELLED },
       include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
     });
 
@@ -376,7 +309,7 @@ export class EngagementsService {
 
     await this.notifications.notifyUser(
       engagement.companyAddress,
-      'ENGAGEMENT_CANCELLED',
+      NotificationType.ENGAGEMENT_CANCELLED,
       `Engagement declined: ${engagement.jobTitle}`,
       `The recruiter has declined the engagement invite for "${engagement.jobTitle}" (${engagementId}).`,
       { engagementId },
@@ -512,32 +445,81 @@ export class EngagementsService {
   }
 
   /**
-   * Delegate to EngagementCandidateDetailsService.
-   * Kept here so the controller interface stays unchanged.
+   * Calculates and retrieves the aggregated summary for an engagement.
    */
   async getSummary(id: string, userId: string): Promise<EngagementSummaryDto> {
-    return this.candidateDetailsService.getSummary(id, userId);
+    const engagement = await this.prisma.engagement.findUnique({
+      where: { id },
+      include: { milestones: true },
+    });
+
+    if (!engagement) {
+      throw new NotFoundException('Engagement not found');
+    }
+
+    if (engagement.clientId !== userId && engagement.freelancerId !== userId) {
+      throw new ForbiddenException('You do not have access to this engagement');
+    }
+
+    let totalAmount = BigInt(0);
+    let releasedAmount = BigInt(0);
+    let milestonesCompleted = 0;
+
+    for (const milestone of engagement.milestones) {
+      const amount = typeof milestone.amount === 'bigint' ? milestone.amount : BigInt(milestone.amount as any);
+      totalAmount += amount;
+
+      if (milestone.status === MilestoneStatus.CONFIRMED || milestone.status === MilestoneStatus.RESOLVED) {
+        releasedAmount += amount;
+        milestonesCompleted++;
+      }
+    }
+
+    const lockedAmount = totalAmount - releasedAmount;
+
+    return {
+      totalAmount: totalAmount.toString(),
+      releasedAmount: releasedAmount.toString(),
+      lockedAmount: lockedAmount.toString(),
+      milestonesTotal: engagement.milestones.length,
+      milestonesCompleted,
+    };
   }
 
   // ----------------------------------------------------------
-  // NOTES — delegated to EngagementNotesService
+  // NOTES
   // ----------------------------------------------------------
 
-  /** Add an internal note (delegates to EngagementNotesService). */
-  createNote(
-    engagementId: string,
-    user: { id: string; stellarAddress?: string; role: string },
-    body: string,
-  ) {
-    return this.notesService.createNote(engagementId, user, body);
+  async createNote(engagementId: string, user: { id: string; stellarAddress?: string; role: string }, body: string) {
+    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
+    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
+    this.checkParticipant(engagement, user);
+
+    return this.prisma.engagementNote.create({
+      data: { engagementId, authorId: user.id, body },
+    });
   }
 
-  /** List internal notes (delegates to EngagementNotesService). */
-  findNotes(
-    engagementId: string,
-    user: { id: string; stellarAddress?: string; role: string },
-  ) {
-    return this.notesService.findNotes(engagementId, user);
+  async findNotes(engagementId: string, user: { id: string; stellarAddress?: string; role: string }) {
+    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
+    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
+    this.checkParticipant(engagement, user);
+
+    return this.prisma.engagementNote.findMany({
+      where: { engagementId },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  private checkParticipant(
+    engagement: { companyAddress: string; recruiterAddress: string; arbiterAddress: string },
+    user: { stellarAddress?: string; role: string },
+  ): void {
+    if (user.role === UserRole.ADMIN) return;
+    const parties = [engagement.companyAddress, engagement.recruiterAddress, engagement.arbiterAddress];
+    if (!user.stellarAddress || !parties.includes(user.stellarAddress)) {
+      throw new ForbiddenException('You are not a participant of this engagement');
+    }
   }
 
   // ----------------------------------------------------------
@@ -558,8 +540,8 @@ export class EngagementsService {
     }
 
     if (
-      engagement.status === 'CANCELLED' ||
-      engagement.status === 'COMPLETED'
+      engagement.status === EngagementStatus.CANCELLED ||
+      engagement.status === EngagementStatus.COMPLETED
     ) {
       throw new ConflictException(
         `Cannot cancel an engagement with status '${engagement.status}'`,
@@ -572,7 +554,7 @@ export class EngagementsService {
     const updated = await this.prisma.$transaction(async (tx) => {
       return tx.engagement.update({
         where: { id: engagementId },
-        data: { status: 'CANCELLED' },
+        data: { status: EngagementStatus.CANCELLED },
         include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
       });
     });
@@ -585,21 +567,21 @@ export class EngagementsService {
     await Promise.allSettled([
       this.notifications.notifyUser(
         engagement.companyAddress,
-        'ENGAGEMENT_CANCELLED',
+        NotificationType.ENGAGEMENT_CANCELLED,
         notifyTitle,
         notifyMessage,
         { engagementId, txHash },
       ),
       this.notifications.notifyUser(
         engagement.recruiterAddress,
-        'ENGAGEMENT_CANCELLED',
+        NotificationType.ENGAGEMENT_CANCELLED,
         notifyTitle,
         notifyMessage,
         { engagementId, txHash },
       ),
       this.notifications.notifyUser(
         engagement.arbiterAddress,
-        'ENGAGEMENT_CANCELLED',
+        NotificationType.ENGAGEMENT_CANCELLED,
         notifyTitle,
         notifyMessage,
         { engagementId, txHash },
@@ -634,9 +616,9 @@ export class EngagementsService {
     }
 
     if (
-      engagement.status === 'CANCELLED' ||
-      engagement.status === 'COMPLETED' ||
-      engagement.status === 'REPLACEMENT_REQUESTED'
+      engagement.status === EngagementStatus.CANCELLED ||
+      engagement.status === EngagementStatus.COMPLETED ||
+      engagement.status === EngagementStatus.REPLACEMENT_REQUESTED
     ) {
       throw new ConflictException(
         `Cannot request replacement for an engagement with status '${engagement.status}'`,
@@ -646,7 +628,7 @@ export class EngagementsService {
     const updated = await this.prisma.$transaction(async (tx) => {
       return tx.engagement.update({
         where: { id: engagementId },
-        data: { status: 'REPLACEMENT_REQUESTED' },
+        data: { status: EngagementStatus.REPLACEMENT_REQUESTED },
         include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
       });
     });
@@ -660,21 +642,21 @@ export class EngagementsService {
     await Promise.allSettled([
       this.notifications.notifyUser(
         engagement.companyAddress,
-        'REPLACEMENT_REQUESTED',
+        NotificationType.REPLACEMENT_REQUESTED,
         notifyTitle,
         notifyMessage,
         { engagementId, reason: reason ?? null },
       ),
       this.notifications.notifyUser(
         engagement.recruiterAddress,
-        'REPLACEMENT_REQUESTED',
+        NotificationType.REPLACEMENT_REQUESTED,
         notifyTitle,
         notifyMessage,
         { engagementId, reason: reason ?? null },
       ),
       this.notifications.notifyUser(
         engagement.arbiterAddress,
-        'REPLACEMENT_REQUESTED',
+        NotificationType.REPLACEMENT_REQUESTED,
         notifyTitle,
         notifyMessage,
         { engagementId, reason: reason ?? null },
@@ -717,16 +699,16 @@ export class EngagementsService {
       const fundingShortfall = escrowBalance !== expectedEscrowBalance;
 
       const statusMap: Record<string, EngagementStatus> = {
-        Active: 'ACTIVE',
-        Completed: 'COMPLETED',
-        Cancelled: 'CANCELLED',
-        ReplacementRequested: 'REPLACEMENT_REQUESTED',
+        Active: EngagementStatus.ACTIVE,
+        Completed: EngagementStatus.COMPLETED,
+        Cancelled: EngagementStatus.CANCELLED,
+        ReplacementRequested: EngagementStatus.REPLACEMENT_REQUESTED,
       };
 
       await this.prisma.engagement.update({
         where: { id: engagementId },
         data: {
-          status: statusMap[onChain.status] ?? 'ACTIVE',
+          status: statusMap[onChain.status] ?? EngagementStatus.ACTIVE,
           releasedAmount,
           escrowBalance,
           fundingShortfall,
@@ -741,14 +723,14 @@ export class EngagementsService {
         await Promise.all([
           this.notifications.notifyUser(
             engagement.companyAddress,
-            'FUNDING_SHORTFALL_DETECTED',
+            NotificationType.FUNDING_SHORTFALL_DETECTED,
             'Engagement funding shortfall detected',
             message,
             { engagementId, expectedEscrowBalance: expectedEscrowBalance.toString(), escrowBalance: escrowBalance.toString() },
           ),
           this.notifications.notifyUser(
             engagement.recruiterAddress,
-            'FUNDING_SHORTFALL_DETECTED',
+            NotificationType.FUNDING_SHORTFALL_DETECTED,
             'Engagement funding shortfall detected',
             message,
             { engagementId, expectedEscrowBalance: expectedEscrowBalance.toString(), escrowBalance: escrowBalance.toString() },
@@ -806,26 +788,19 @@ export class EngagementsService {
     });
     if (!engagement) throw new NotFoundException('Engagement not found');
 
-    if (userRole !== 'ARBITER' || !engagement.arbiter || engagement.arbiter.id !== userId) {
+    if (userRole !== UserRole.ARBITER || !engagement.arbiter || engagement.arbiter.id !== userId) {
       throw new ForbiddenException('Only the assigned arbiter can recuse themselves');
     }
 
-    // Persist the recusal so auto-assignment never routes this engagement's disputes back to them (#383)
-    await this.prisma.arbiterRecusal.upsert({
-      where: { engagementId_arbiterId: { engagementId, arbiterId: userId } },
-      update: {},
-      create: { engagementId, arbiterId: userId },
-    });
-
     // Notify all admins
     const admins = await this.prisma.user.findMany({
-      where: { role: 'ADMIN', deactivatedAt: null },
+      where: { role: UserRole.ADMIN, deactivatedAt: null },
     });
 
     for (const admin of admins) {
       await this.notifications.notifyUserById(
         admin.id,
-        'ARBITER_RECUSAL_REQUESTED',
+        NotificationType.ARBITER_RECUSAL_REQUESTED,
         'Arbiter Recusal Requested',
         `Arbiter ${engagement.arbiter?.name} has recused themselves from engagement ${engagementId}. Please reassign.`,
         { engagementId, arbiterId: userId },
@@ -904,20 +879,123 @@ export class EngagementsService {
   }
 
   // ----------------------------------------------------------
-  // CSV BULK IMPORT (#254) — delegated to EngagementImportService
+  // CSV BULK IMPORT (#254)
   // ----------------------------------------------------------
 
   /**
-   * Delegate CSV bulk import to EngagementImportService.
-   * Kept here so the controller interface stays unchanged.
+   * Parses a multipart CSV upload and attempts to create each row as an engagement.
+   * Invalid rows are collected in the errors report without stopping the rest of the batch.
+   *
+   * Expected CSV columns:
+   *   engagementId, companyAddress, recruiterAddress, arbiterAddress, tokenAddress,
+   *   totalAmount, jobTitle, jobDescription (opt), salaryRange (opt), location (opt),
+   *   tags (opt, pipe-separated e.g. "engineering|urgent")
+   *
+   * The CSV must include a header row.
    */
-  importFromCsv(user: User, file: Express.Multer.File) {
-    return this.importService.importFromCsv(user, file);
+  async importFromCsv(user: User, file: Express.Multer.File) {
+    if (!file?.buffer) {
+      throw new BadRequestException('No file provided or file is empty');
+    }
+
+    const csv = file.buffer.toString('utf-8');
+    const lines = csv.split(/\r?\n/).filter((l) => l.trim().length > 0);
+
+    if (lines.length < 2) {
+      throw new BadRequestException('CSV file must contain a header row and at least one data row');
+    }
+
+    const REQUIRED_COLUMNS = [
+      'engagementId', 'companyAddress', 'recruiterAddress', 'arbiterAddress',
+      'tokenAddress', 'totalAmount', 'jobTitle',
+    ];
+
+    const headers = lines[0].split(',').map((h) => h.trim());
+    const missingRequired = REQUIRED_COLUMNS.filter((c) => !headers.includes(c));
+    if (missingRequired.length > 0) {
+      throw new BadRequestException(
+        `CSV is missing required column(s): ${missingRequired.join(', ')}`,
+      );
+    }
+
+    const results: Array<{ row: number; engagementId?: string; success: boolean; error?: string }> = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      const rowNum = i + 1; // 1-based, accounting for header at row 1
+      try {
+        const values = this.parseCsvLine(lines[i]);
+        const row: Record<string, string> = {};
+        headers.forEach((h, idx) => {
+          row[h] = values[idx]?.trim() ?? '';
+        });
+
+        // Per-row required-field validation
+        const rowMissing = REQUIRED_COLUMNS.filter((c) => !row[c]);
+        if (rowMissing.length > 0) {
+          throw new Error(`Missing required field(s): ${rowMissing.join(', ')}`);
+        }
+
+        const dto: CreateEngagementDto = {
+          engagementId: row['engagementId'],
+          companyAddress: row['companyAddress'],
+          recruiterAddress: row['recruiterAddress'],
+          arbiterAddress: row['arbiterAddress'],
+          tokenAddress: row['tokenAddress'],
+          totalAmount: row['totalAmount'],
+          jobTitle: row['jobTitle'],
+          jobDescription: row['jobDescription'] || undefined,
+          salaryRange: row['salaryRange'] || undefined,
+          location: row['location'] || undefined,
+          // CSV import does not support milestone configuration inline — use templates for that
+          milestones: [],
+        };
+
+        await this.create(user, dto);
+        successCount++;
+        results.push({ row: rowNum, engagementId: dto.engagementId, success: true });
+      } catch (error) {
+        failureCount++;
+        results.push({ row: rowNum, success: false, error: error.message ?? String(error) });
+        this.logger.warn(`CSV import row ${rowNum} failed: ${error.message}`);
+      }
+    }
+
+    this.logger.log(`CSV import complete: ${successCount} created, ${failureCount} failed`);
+    return {
+      totalRows: lines.length - 1,
+      successCount,
+      failureCount,
+      results,
+    };
   }
 
-  // ----------------------------------------------------------
-  // SERIALISE HELPERS
-  // ----------------------------------------------------------
+  /** Splits a single CSV line, handling double-quoted fields. */
+  private parseCsvLine(line: string): string[] {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        result.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current);
+    return result;
+  }
 
   private serialize(engagement: any) {
     return {
@@ -987,7 +1065,7 @@ export class EngagementsService {
       for (const address of usersToNotify) {
         await this.notifications.notifyUser(
           address,
-          'ENGAGEMENT_CANCELLED', // Using CANCELLED as a generic override notification type for now
+          NotificationType.ENGAGEMENT_CANCELLED, // Using CANCELLED as a generic override notification type for now
           `Engagement ${engagementId} status updated by Admin`,
           `The status of engagement ${engagementId} has been manually changed from ${oldStatus} to ${newStatus} by an administrator. Reason: ${reason}`,
           { engagementId, oldStatus, newStatus, reason },
@@ -1000,317 +1078,5 @@ export class EngagementsService {
     );
 
     return this.findOne(engagementId);
-  }
-
-  // ----------------------------------------------------------
-  // ENGAGEMENT COMMENTS (#368)
-  // ----------------------------------------------------------
-
-  async createComment(engagementId: string, user: { id: string; stellarAddress?: string; role: string }, body: string) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    this.checkParticipant(engagement, user);
-
-    const comment = await this.prisma.engagementComment.create({
-      data: { engagementId, authorId: user.id, body },
-      include: { author: { select: { id: true, name: true } } },
-    });
-
-    // Notify the other party (not the author)
-    const otherPartyAddress = engagement.companyAddress === user.stellarAddress 
-      ? engagement.recruiterAddress 
-      : engagement.companyAddress;
-
-    await this.notifications.notifyUser(
-      otherPartyAddress,
-      NotificationType.COMMENT_ADDED,
-      `New comment on engagement: ${engagement.jobTitle}`,
-      `${comment.author.name || 'A participant'} added a comment: "${body.substring(0, 100)}${body.length > 100 ? '...' : ''}"`,
-      { engagementId, commentId: comment.id },
-    );
-
-    // Also notify watchers
-    await this.notifyWatchers(engagementId, NotificationType.COMMENT_ADDED, 
-      `New comment on engagement: ${engagement.jobTitle}`,
-      `${comment.author.name || 'A participant'} added a comment`,
-      { engagementId, commentId: comment.id },
-      user.id // exclude the author
-    );
-
-    return this.serializeComment(comment, user.id);
-  }
-
-  async listComments(engagementId: string, user: { id: string; stellarAddress?: string; role: string }) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    this.checkParticipant(engagement, user);
-
-    const comments = await this.prisma.engagementComment.findMany({
-      where: { engagementId },
-      include: { author: { select: { id: true, name: true } } },
-      orderBy: { createdAt: 'asc' },
-    });
-
-    return comments.map(c => this.serializeComment(c, user.id));
-  }
-
-  async updateComment(commentId: string, user: { id: string; role: string }, body: string) {
-    const comment = await this.prisma.engagementComment.findUnique({
-      where: { id: commentId },
-      include: { engagement: true, author: { select: { id: true, name: true } } },
-    });
-
-    if (!comment) throw new NotFoundException(`Comment ${commentId} not found`);
-    
-    // Only the author can edit
-    if (comment.authorId !== user.id) {
-      throw new ForbiddenException('You can only edit your own comments');
-    }
-
-    // Check 15-minute edit window
-    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
-    if (comment.createdAt < fifteenMinutesAgo) {
-      throw new ForbiddenException('Comments can only be edited within 15 minutes of creation');
-    }
-
-    const updated = await this.prisma.engagementComment.update({
-      where: { id: commentId },
-      data: { body, editedAt: new Date() },
-      include: { author: { select: { id: true, name: true } } },
-    });
-
-    return this.serializeComment(updated, user.id);
-  }
-
-  private serializeComment(comment: any, currentUserId: string) {
-    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
-    const canEdit = comment.authorId === currentUserId && comment.createdAt >= fifteenMinutesAgo;
-
-    return {
-      id: comment.id,
-      engagementId: comment.engagementId,
-      authorId: comment.authorId,
-      authorName: comment.author?.name || 'Unknown',
-      body: comment.body,
-      editedAt: comment.editedAt?.toISOString() ?? null,
-      canEdit,
-      createdAt: comment.createdAt.toISOString(),
-      updatedAt: comment.updatedAt.toISOString(),
-    };
-  }
-
-  // ----------------------------------------------------------
-  // ENGAGEMENT WATCHERS (#369)
-  // ----------------------------------------------------------
-
-  async addWatcher(engagementId: string, requestingUser: { id: string; stellarAddress?: string; role: string }, targetUserId: string) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    
-    // Only participants can add watchers
-    this.checkParticipant(engagement, requestingUser);
-
-    // Check if the target user exists and is part of the same company
-    const targetUser = await this.prisma.user.findUnique({ where: { id: targetUserId } });
-    if (!targetUser) throw new NotFoundException(`User ${targetUserId} not found`);
-
-    // Verify the target user is a company member (same companyOwnerId or is the owner)
-    const requestingFullUser = await this.prisma.user.findUnique({ where: { id: requestingUser.id } });
-    if (requestingFullUser.role === UserRole.COMPANY) {
-      const isOwner = requestingFullUser.companyOwnerId === null;
-      const targetIsTeamMember = 
-        targetUser.id === requestingFullUser.id ||
-        targetUser.companyOwnerId === requestingFullUser.id ||
-        (requestingFullUser.companyOwnerId && targetUser.companyOwnerId === requestingFullUser.companyOwnerId);
-
-      if (!targetIsTeamMember && requestingUser.role !== UserRole.ADMIN) {
-        throw new ForbiddenException('Can only add watchers from your company team');
-      }
-    }
-
-    // Check if already watching
-    const existing = await this.prisma.engagementWatcher.findUnique({
-      where: { engagementId_userId: { engagementId, userId: targetUserId } },
-    });
-    if (existing) {
-      throw new ConflictException('User is already watching this engagement');
-    }
-
-    const watcher = await this.prisma.engagementWatcher.create({
-      data: { engagementId, userId: targetUserId, addedBy: requestingUser.id },
-      include: {
-        user: { select: { id: true, name: true, email: true } },
-        adder: { select: { id: true, name: true } },
-      },
-    });
-
-    // Notify the newly added watcher
-    await this.notifications.notifyUserById(
-      targetUserId,
-      NotificationType.WATCHER_ADDED,
-      `Added as watcher: ${engagement.jobTitle}`,
-      `${watcher.adder.name || 'A team member'} added you as a watcher to the engagement "${engagement.jobTitle}"`,
-      { engagementId },
-    );
-
-    return this.serializeWatcher(watcher);
-  }
-
-  async removeWatcher(engagementId: string, requestingUser: { id: string; stellarAddress?: string; role: string }, targetUserId: string) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-
-    const watcher = await this.prisma.engagementWatcher.findUnique({
-      where: { engagementId_userId: { engagementId, userId: targetUserId } },
-    });
-    if (!watcher) throw new NotFoundException('Watcher not found');
-
-    // Users can remove themselves, or participants can remove any watcher
-    const canRemove = 
-      watcher.userId === requestingUser.id || 
-      requestingUser.role === UserRole.ADMIN ||
-      this.isParticipant(engagement, requestingUser);
-
-    if (!canRemove) {
-      throw new ForbiddenException('Not authorized to remove this watcher');
-    }
-
-    await this.prisma.engagementWatcher.delete({
-      where: { id: watcher.id },
-    });
-
-    return { message: 'Watcher removed successfully' };
-  }
-
-  async listWatchers(engagementId: string, user: { id: string; stellarAddress?: string; role: string }) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    this.checkParticipant(engagement, user);
-
-    const watchers = await this.prisma.engagementWatcher.findMany({
-      where: { engagementId },
-      include: {
-        user: { select: { id: true, name: true, email: true } },
-        adder: { select: { id: true, name: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    return watchers.map(w => this.serializeWatcher(w));
-  }
-
-  private serializeWatcher(watcher: any) {
-    return {
-      id: watcher.id,
-      engagementId: watcher.engagementId,
-      userId: watcher.userId,
-      userName: watcher.user?.name || 'Unknown',
-      userEmail: watcher.user?.email || '',
-      addedBy: watcher.addedBy,
-      addedByName: watcher.adder?.name || 'Unknown',
-      createdAt: watcher.createdAt.toISOString(),
-    };
-  }
-
-  private async notifyWatchers(
-    engagementId: string, 
-    type: NotificationType, 
-    title: string, 
-    message: string, 
-    data: Record<string, any>,
-    excludeUserId?: string
-  ) {
-    const watchers = await this.prisma.engagementWatcher.findMany({
-      where: { engagementId },
-      select: { userId: true },
-    });
-
-    const notifyPromises = watchers
-      .filter(w => w.userId !== excludeUserId)
-      .map(w => this.notifications.notifyUserById(w.userId, type, title, message, data));
-
-    await Promise.allSettled(notifyPromises);
-  }
-
-  private isParticipant(
-    engagement: { companyAddress: string; recruiterAddress: string; arbiterAddress: string },
-    user: { stellarAddress?: string; role: string },
-  ): boolean {
-    if (user.role === UserRole.ADMIN) return true;
-    const parties = [engagement.companyAddress, engagement.recruiterAddress, engagement.arbiterAddress];
-    return user.stellarAddress ? parties.includes(user.stellarAddress) : false;
-  }
-
-  // ----------------------------------------------------------
-  // PLACED CANDIDATE DETAILS (#368)
-  // ----------------------------------------------------------
-
-  async updateCandidateDetails(
-    engagementId: string, 
-    user: { id: string; stellarAddress?: string; role: string },
-    details: {
-      candidateName?: string;
-      candidateEmail?: string;
-      candidatePhone?: string;
-      candidateStartDate?: string;
-      candidateRole?: string;
-    }
-  ) {
-    const engagement = await this.prisma.engagement.findUnique({ where: { id: engagementId } });
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    this.checkParticipant(engagement, user);
-
-    const updateData: any = {};
-    if (details.candidateName !== undefined) updateData.candidateName = details.candidateName;
-    if (details.candidateEmail !== undefined) updateData.candidateEmail = details.candidateEmail;
-    if (details.candidatePhone !== undefined) updateData.candidatePhone = details.candidatePhone;
-    if (details.candidateStartDate !== undefined) updateData.candidateStartDate = details.candidateStartDate ? new Date(details.candidateStartDate) : null;
-    if (details.candidateRole !== undefined) updateData.candidateRole = details.candidateRole;
-
-    // Set placedAt if this is the first time candidate details are being added
-    if (!engagement.placedAt && Object.keys(updateData).length > 0) {
-      updateData.placedAt = new Date();
-    }
-
-    const updated = await this.prisma.engagement.update({
-      where: { id: engagementId },
-      data: updateData,
-    });
-
-    return this.serializeCandidateDetails(updated);
-  }
-
-  async getCandidateDetails(engagementId: string, user: { id: string; stellarAddress?: string; role: string }) {
-    const engagement = await this.prisma.engagement.findUnique({ 
-      where: { id: engagementId },
-      select: {
-        id: true,
-        candidateName: true,
-        candidateEmail: true,
-        candidatePhone: true,
-        candidateStartDate: true,
-        candidateRole: true,
-        placedAt: true,
-        companyAddress: true,
-        recruiterAddress: true,
-        arbiterAddress: true,
-      }
-    });
-
-    if (!engagement) throw new NotFoundException(`Engagement ${engagementId} not found`);
-    this.checkParticipant(engagement, user);
-
-    return this.serializeCandidateDetails(engagement);
-  }
-
-  private serializeCandidateDetails(engagement: any) {
-    return {
-      candidateName: engagement.candidateName ?? null,
-      candidateEmail: engagement.candidateEmail ?? null,
-      candidatePhone: engagement.candidatePhone ?? null,
-      candidateStartDate: engagement.candidateStartDate?.toISOString() ?? null,
-      candidateRole: engagement.candidateRole ?? null,
-      placedAt: engagement.placedAt?.toISOString() ?? null,
-    };
   }
 }

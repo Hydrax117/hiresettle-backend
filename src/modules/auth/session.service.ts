@@ -66,7 +66,7 @@ export class SessionService {
       throw new UnauthorizedException('Refresh token is no longer valid');
     }
 
-    if (this.isSessionIdle(stored, now)) {
+    if (this.isSessionIdle(stored as any, now)) {
       throw new UnauthorizedException('Session has expired due to inactivity');
     }
 

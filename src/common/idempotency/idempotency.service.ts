@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 const IDEMPOTENCY_KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -34,8 +35,8 @@ export class IdempotencyService {
     const expiresAt = new Date(Date.now() + IDEMPOTENCY_KEY_TTL_MS);
     await this.prisma.idempotencyKey.upsert({
       where: { key_userId: { key, userId } },
-      create: { key, userId, response, expiresAt },
-      update: { response, expiresAt },
+      create: { key, userId, response: response as Prisma.InputJsonValue, expiresAt },
+      update: { response: response as Prisma.InputJsonValue, expiresAt },
     });
   }
 }

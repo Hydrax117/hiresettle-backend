@@ -66,7 +66,7 @@ export class AdminAuditLogsService {
     ]);
 
     // Transform to unified format
-    const unifiedLogs: UnifiedAuditLog[] = [
+    const unifiedLogs: UnifiedAuditLog[] = ([
       ...auditLogs.map((log) => ({
         id: log.id,
         type: 'AuditLog' as const,
@@ -74,7 +74,7 @@ export class AdminAuditLogsService {
         action: log.action,
         entityType: log.entityType,
         entityId: log.entityId,
-        oldValue: log.oldValue,
+        oldValue: log.oldValue ?? undefined,
         newValue: log.newValue,
         reason: log.reason,
         createdAt: log.createdAt,
@@ -103,7 +103,7 @@ export class AdminAuditLogsService {
         reason: undefined,
         createdAt: log.createdAt,
       })),
-    ];
+    ] as UnifiedAuditLog[]);
 
     // Sort by createdAt descending
     unifiedLogs.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());

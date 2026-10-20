@@ -8,6 +8,8 @@ import {
 import { EngagementStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { UserDataExportDto } from './dto/user-data-export.dto';
+import { DeleteAccountDto } from './dto/delete-account.dto';
+import { AuthService } from '../auth/auth.service';
 
 @Injectable()
 export class GdprService {
@@ -148,7 +150,7 @@ export class GdprService {
   }
 
   /** DELETE /users/me — anonymise PII, retain stellarAddress for on-chain integrity */
-  async requestErasure(userId: string): Promise<{ message: string }> {
+  async requestErasure(userId: string, dto: DeleteAccountDto): Promise<{ message: string }> {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
 

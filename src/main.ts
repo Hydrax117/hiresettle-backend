@@ -1,56 +1,45 @@
-import "./tracing";
-import { NestFactory } from "@nestjs/core";
-import { ValidationPipe, Logger, RequestMethod } from "@nestjs/common";
-import { SwaggerModule, DocumentBuilder } from "@nestjs/swagger";
-import * as express from "express";
-import { ConfigService } from "@nestjs/config";
-import helmet from "helmet";
-import * as Sentry from "@sentry/node";
-import { WINSTON_MODULE_NEST_PROVIDER } from "nest-winston";
-import { AppModule } from "./app.module";
-import { HttpExceptionFilter } from "./common/filters/http-exception.filter";
-import { TransformInterceptor } from "./common/interceptors/transform.interceptor";
-import { TooManyRequestsHeadersFilter } from "./common/filters/too-many-requests-headers.filter";
-import { TracingInterceptor } from "./common/interceptors/tracing.interceptor";
-import { assertSecureJwtSecret } from "./common/utils/jwt-secret.util";
-import { createCompressionMiddleware } from "./common/utils/compression.util";
-import { JwtService } from "@nestjs/jwt";
-import { HttpMetricsInterceptor } from "./metrics/http-metrics.interceptor";
-import { MetricsService } from "./metrics/metrics.service";
+import './tracing';
+import { NestFactory } from '@nestjs/core';
+import { ValidationPipe, Logger, RequestMethod } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { ConfigService } from '@nestjs/config';
+import helmet from 'helmet';
+import * as Sentry from '@sentry/node';
+import { WINSTON_MODULE_NEST_PROVIDER } from 'nest-winston';
+import { AppModule } from './app.module';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { TooManyRequestsHeadersFilter } from './common/filters/too-many-requests-headers.filter';
+import { TracingInterceptor } from './common/interceptors/tracing.interceptor';
+import { assertSecureJwtSecret } from './common/utils/jwt-secret.util';
+import { JwtService } from '@nestjs/jwt';
+import { HttpMetricsInterceptor } from './metrics/http-metrics.interceptor';
+import { MetricsService } from './metrics/metrics.service';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
-  app.use("/webhooks/billing", express.raw({ type: "application/json" }));
   const logger = app.get(WINSTON_MODULE_NEST_PROVIDER);
   app.useLogger(logger);
 
   const config = app.get(ConfigService);
-  const nodeEnv = config.get<string>("NODE_ENV");
+  const nodeEnv = config.get<string>('NODE_ENV');
 
-  if (!["test", "ci"].includes(nodeEnv)) {
-    assertSecureJwtSecret(config.get<string>("JWT_SECRET"));
+  if (!['test', 'ci'].includes(nodeEnv ?? '')) {
+    assertSecureJwtSecret(config.get<string>('JWT_SECRET') ?? '');
   }
 
-  const port = config.get<number>("PORT", 3000);
-  const apiPrefix = config.get<string>("API_PREFIX", "api/v1");
+  const port = config.get<number>('PORT', 3000);
+  const apiPrefix = config.get<string>('API_PREFIX', 'api/v1');
   const allowedOriginsStr = config.get<string>(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3001",
+    'ALLOWED_ORIGINS',
+    'http://localhost:3001',
   );
   const allowedOrigins = allowedOriginsStr
-    .split(",")
-    .map((origin) => origin.trim());
-  const corsAllowedHeaders = config
-    .get<string>(
-      'CORS_ALLOWED_HEADERS',
-      'Content-Type, Authorization, Idempotency-Key, X-API-Key, If-None-Match, X-Request-Id',
-    )
     .split(',')
-    .map((header) => header.trim())
-    .filter(Boolean);
+    .map((origin) => origin.trim());
   const sentryDsn = config.get<string>('SENTRY_DSN');
 
-  if (sentryDsn && !["test", "ci"].includes(nodeEnv)) {
+  if (sentryDsn && !['test', 'ci'].includes(nodeEnv ?? '')) {
     Sentry.init({
       dsn: sentryDsn,
       tracesSampleRate: 1.0,
@@ -58,9 +47,6 @@ async function bootstrap() {
     app.use(Sentry.Handlers.requestHandler());
     app.use(Sentry.Handlers.errorHandler());
   }
-
-  // Compress responses (gzip/brotli), skipping SSE streams (#514)
-  app.use(createCompressionMiddleware());
 
   // Configure Helmet security headers
   app.use(
@@ -72,7 +58,7 @@ async function bootstrap() {
         preload: true,
       },
       frameguard: {
-        action: "deny", // X-Frame-Options: DENY
+        action: 'deny', // X-Frame-Options: DENY
       },
     }),
   );
@@ -90,32 +76,23 @@ async function bootstrap() {
       return callback(null, true);
     }
     const msg =
-      "The CORS policy for this site does not allow access from the specified origin.";
+      'The CORS policy for this site does not allow access from the specified origin.';
     return callback(new Error(msg), false);
   };
 
   app.enableCors({
     origin: corsOriginValidator,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: corsAllowedHeaders,
-    exposedHeaders: [
-      'ETag',
-      'X-Request-Id',
-      'X-Request-ID',
-      'Retry-After',
-      'X-RateLimit-Limit',
-      'X-RateLimit-Remaining',
-      'X-RateLimit-Reset',
-    ],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     credentials: true,
   });
 
   app.setGlobalPrefix(apiPrefix, {
     exclude: [
-      { path: "health", method: RequestMethod.GET },
-      { path: "docs", method: RequestMethod.GET },
-      { path: "docs-json", method: RequestMethod.GET },
-      { path: "metrics", method: RequestMethod.GET },
+      { path: 'health', method: RequestMethod.GET },
+      { path: 'docs', method: RequestMethod.GET },
+      { path: 'docs-json', method: RequestMethod.GET },
+      { path: 'metrics', method: RequestMethod.GET },
     ],
   });
 
@@ -132,10 +109,8 @@ async function bootstrap() {
   );
 
   const metricsService = app.get(MetricsService);
-  const reflector = app.get(Reflector);
   app.useGlobalInterceptors(
     new HttpMetricsInterceptor(metricsService),
-    new RateLimitHeadersInterceptor(reflector, config),
     new TracingInterceptor(),
     new TransformInterceptor(),
   );
@@ -145,40 +120,35 @@ async function bootstrap() {
   app.useGlobalFilters(new TooManyRequestsHeadersFilter());
   app.useGlobalFilters(new HttpExceptionFilter());
 
-  if (nodeEnv !== "production") {
+  if (nodeEnv !== 'production') {
     const swaggerConfig = new DocumentBuilder()
-      .setTitle("HireSettle API")
+      .setTitle('HireSettle API')
       .setDescription(
-        "Backend API for HireSettle — milestone-based recruiter fee escrow on Stellar Soroban",
+        'Backend API for HireSettle — milestone-based recruiter fee escrow on Stellar Soroban',
       )
-      .setVersion("1.0")
+      .setVersion('1.0')
       .addBearerAuth()
       .addApiKey(
-        {
-          type: "apiKey",
-          name: "X-Api-Key",
-          in: "header",
-          description: "Server-to-server API key",
-        },
-        "api-key",
+        { type: 'apiKey', name: 'X-Api-Key', in: 'header', description: 'Server-to-server API key' },
+        'api-key',
       )
-      .addTag("engagements", "Recruitment engagement lifecycle")
-      .addTag("milestones", "Milestone proof, unlock, and confirmation")
-      .addTag("events", "On-chain Stellar event feed")
-      .addTag("notifications", "User notifications")
-      .addTag("auth", "Email/password, Google OAuth, and session management")
-      .addTag("health", "Health check endpoints")
+      .addTag('engagements', 'Recruitment engagement lifecycle')
+      .addTag('milestones', 'Milestone proof, unlock, and confirmation')
+      .addTag('events', 'On-chain Stellar event feed')
+      .addTag('notifications', 'User notifications')
+      .addTag('auth', 'Email/password, Google OAuth, and session management')
+      .addTag('health', 'Health check endpoints')
       .setBasePath(apiPrefix)
       .build();
 
     const document = SwaggerModule.createDocument(app, swaggerConfig);
-    SwaggerModule.setup("docs", app, document, {
+    SwaggerModule.setup('docs', app, document, {
       swaggerOptions: { persistAuthorization: true },
     });
 
     // Add docs-json endpoint for Postman import
     const httpAdapter = app.getHttpAdapter();
-    httpAdapter.get("/docs-json", (req: any, res: any) => {
+    httpAdapter.get('/docs-json', (req: any, res: any) => {
       res.json(document);
     });
 
@@ -186,25 +156,23 @@ async function bootstrap() {
     logger.log(`OpenAPI JSON available at http://localhost:${port}/docs-json`);
   }
 
-  if (nodeEnv !== "production") {
-    const { createBullBoard } = await import("@bull-board/api");
-    const { BullMQAdapter } = await import("@bull-board/api/bullMQAdapter");
-    const { ExpressAdapter } = await import("@bull-board/express");
-    const { Queue } = await import("bullmq");
+  if (nodeEnv !== 'production') {
+    const { createBullBoard } = await import('@bull-board/api');
+    const { BullMQAdapter } = await import('@bull-board/api/bullMQAdapter');
+    const { ExpressAdapter } = await import('@bull-board/express');
+    const { Queue } = await import('bullmq');
 
-    const redisUrl = config.get<string>("REDIS_URL", "redis://localhost:6379");
+    const redisUrl = config.get<string>('REDIS_URL', 'redis://localhost:6379');
     const connection = { url: redisUrl };
 
     const serverAdapter = new ExpressAdapter();
-    serverAdapter.setBasePath("/admin/queues");
+    serverAdapter.setBasePath('/admin/queues');
 
     createBullBoard({
       queues: [
-        new BullMQAdapter(new Queue("email", { connection })),
-        new BullMQAdapter(new Queue("stellar-tx", { connection })),
-        new BullMQAdapter(new Queue("webhook", { connection })),
-        new BullMQAdapter(new Queue("slack", { connection })),
-        new BullMQAdapter(new Queue("teams", { connection })),
+        new BullMQAdapter(new Queue('email', { connection })),
+        new BullMQAdapter(new Queue('stellar-tx', { connection })),
+        new BullMQAdapter(new Queue('webhook', { connection })),
       ],
       serverAdapter,
     });
@@ -213,23 +181,20 @@ async function bootstrap() {
     const httpAdapter = app.getHttpAdapter();
     const instance: any = httpAdapter.getInstance();
 
-    instance.use("/admin/queues", (req: any, res: any, next: any) => {
-      const token = req.headers.authorization?.split(" ")[1];
-      if (!token) return res.status(401).json({ message: "Unauthorized" });
+    instance.use('/admin/queues', (req: any, res: any, next: any) => {
+      const token = req.headers.authorization?.split(' ')[1];
+      if (!token) return res.status(401).json({ message: 'Unauthorized' });
       try {
         const payload: any = jwtService.verify(token);
-        if (payload.role !== "ADMIN")
-          return res.status(403).json({ message: "Forbidden" });
+        if (payload.role !== 'ADMIN') return res.status(403).json({ message: 'Forbidden' });
         next();
       } catch {
-        res.status(401).json({ message: "Invalid token" });
+        res.status(401).json({ message: 'Invalid token' });
       }
     });
 
-    instance.use("/admin/queues", serverAdapter.getRouter());
-    logger.log(
-      "Bull Board available at http://localhost:" + port + "/admin/queues",
-    );
+    instance.use('/admin/queues', serverAdapter.getRouter());
+    logger.log('Bull Board available at http://localhost:' + port + '/admin/queues');
   }
 
   await app.listen(port);

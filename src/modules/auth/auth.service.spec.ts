@@ -439,8 +439,8 @@ describe('AuthService', () => {
       const stored = makeRefreshToken({ user: makeUser() });
       mockPrisma.refreshToken.findUnique.mockResolvedValue(stored);
 
-      let txUpdateMany: jest.Mock;
-      let txCreate: jest.Mock;
+      let txUpdateMany: jest.Mock = jest.fn();
+      let txCreate: jest.Mock = jest.fn();
       mockPrisma.$transaction.mockImplementation(async (fn: any) => {
         if (typeof fn === 'function') {
           txUpdateMany = jest.fn().mockResolvedValue({ count: 1 });
