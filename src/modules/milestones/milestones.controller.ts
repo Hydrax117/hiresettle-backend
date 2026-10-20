@@ -306,6 +306,23 @@ export class MilestonesController {
     return this.milestonesService.uploadEvidence(engagementId, index, file, user);
   }
 
+  @Get(':index/evidence/:evidenceId/download')
+  @ApiOperation({ summary: 'Get a download URL for an evidence file (only once it has passed malware scanning)' })
+  @ApiParam({ name: 'index', type: Number })
+  @ApiParam({ name: 'evidenceId', description: 'Evidence ID' })
+  @ApiResponse({ status: 200, description: 'Presigned download URL' })
+  @ApiResponse({ status: 403, description: 'Not a party to this engagement' })
+  @ApiResponse({ status: 404, description: 'Evidence not found' })
+  @ApiResponse({ status: 409, description: 'File not yet scanned, or quarantined as infected' })
+  downloadEvidence(
+    @Param('engagementId') engagementId: string,
+    @Param('index', ParseIntPipe) index: number,
+    @Param('evidenceId') evidenceId: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.milestonesService.getEvidenceDownloadUrl(engagementId, index, evidenceId, user);
+  }
+
   /**
    * PATCH /api/v1/engagements/:engagementId/milestones/:index/due-date
    * Set or clear the expected proof-submission date on a PLACEMENT milestone (#260).

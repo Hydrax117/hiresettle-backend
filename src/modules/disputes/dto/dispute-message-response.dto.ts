@@ -14,7 +14,9 @@ export class DisputeMessageResponseDto {
   @ApiPropertyOptional() attachmentName?: string | null;
   @ApiPropertyOptional() attachmentSize?: number | null;
   @ApiPropertyOptional() attachmentMimeType?: string | null;
-  /** Pre-signed S3 URL valid for 1 hour; null when no attachment. */
+  /** Malware scan state of the attachment (#471); null when no attachment. */
+  @ApiPropertyOptional({ enum: ['PENDING', 'CLEAN', 'INFECTED'] }) attachmentScanStatus?: string | null;
+  /** Pre-signed S3 URL valid for 1 hour; null when no attachment or not yet scanned CLEAN. */
   @ApiPropertyOptional() attachmentUrl?: string | null;
   @ApiProperty() createdAt: Date;
 }

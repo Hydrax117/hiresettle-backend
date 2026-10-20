@@ -12,6 +12,7 @@ import {
   DisputeOutcome,
   DisputeStage,
   DisputeStatus,
+  FileScanStatus,
   MilestoneStatus,
   NotificationType,
   UserRole,
@@ -20,6 +21,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { S3Service } from '../../common/s3/s3.service';
+import { FileScanService } from '../../common/file-scan/file-scan.service';
 import { ArbiterAssignmentService, EngagementParties } from './arbiter-assignment.service';
 import { DisputeSlaService } from './dispute-sla.service';
 import { ACTIVE_DISPUTE_STATUSES } from './dispute.constants';
@@ -55,7 +57,9 @@ export class DisputesService {
     private readonly config: ConfigService,
     private readonly arbiters: ArbiterAssignmentService,
     private readonly sla: DisputeSlaService,
+    private readonly s3: S3Service,
     @Optional() private readonly systemConfig?: SystemConfigService,
+    @Optional() private readonly fileScan?: FileScanService,
   ) {
     this.appealWindowHours = Number(this.config.get('DISPUTE_APPEAL_WINDOW_HOURS', 72));
     // Window during which either party may submit dispute evidence (#499).
@@ -405,7 +409,8 @@ export class DisputesService {
   /**
    * Verify the actor may access this dispute's messages, then return all
    * messages newest-first. Pre-signed S3 URLs are generated on the fly for
-   * any attachment so the caller never needs raw S3 keys.
+   * any attachment so the caller never needs raw S3 keys — but only once the
+   * attachment has passed malware scanning (#471).
    */
   async listMessages(disputeId: string, actor: DisputeActor) {
     const dispute = await this.prisma.dispute.findUnique({
@@ -430,7 +435,8 @@ export class DisputesService {
         attachmentName: m.attachmentName,
         attachmentSize: m.attachmentSize,
         attachmentMimeType: m.attachmentMimeType,
-        attachmentUrl: m.attachmentS3Key
+        attachmentScanStatus: m.attachmentScanStatus,
+        attachmentUrl: m.attachmentS3Key && m.attachmentScanStatus === FileScanStatus.CLEAN
           ? await this.s3.getPresignedUrl(m.attachmentS3Key).catch(() => null)
           : null,
         createdAt: m.createdAt,
@@ -474,11 +480,15 @@ export class DisputesService {
               attachmentName: attachment.originalname,
               attachmentSize: attachment.size,
               attachmentMimeType: attachment.mimetype,
+              attachmentScanStatus: FileScanStatus.PENDING,
             }
           : {}),
       },
       include: { author: { select: { id: true, name: true, email: true } } },
     });
+    if (attachmentS3Key) {
+      await this.fileScan?.enqueue('dispute-message', message.id);
+    }
 
     // Notify every participant except the author.
     await this.notifyMessageParticipants(dispute, actor, message.id);
@@ -491,9 +501,9 @@ export class DisputesService {
       attachmentName: message.attachmentName,
       attachmentSize: message.attachmentSize,
       attachmentMimeType: message.attachmentMimeType,
-      attachmentUrl: attachmentS3Key
-        ? await this.s3.getPresignedUrl(attachmentS3Key).catch(() => null)
-        : null,
+      attachmentScanStatus: message.attachmentScanStatus,
+      // Not downloadable until the malware scan marks it CLEAN (#471).
+      attachmentUrl: null,
       createdAt: message.createdAt,
     };
   }

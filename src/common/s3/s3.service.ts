@@ -7,6 +7,7 @@ import {
   ListObjectsV2Command,
   DeleteObjectCommand,
   HeadObjectCommand,
+  CopyObjectCommand,
 } from '@aws-sdk/client-s3';import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 @Injectable()
@@ -59,6 +60,34 @@ export class S3Service {
       ContentType: contentType,
     });
     return await getSignedUrl(this.s3, command, { expiresIn: expiresIn ?? this.defaultPresignedUrlExpiry });
+  }
+
+  /**
+   * Download an object's full contents into memory.
+   */
+  async getObjectBuffer(key: string): Promise<Buffer> {
+    const command = new GetObjectCommand({
+      Bucket: this.bucket,
+      Key: key,
+    });
+    const response = await this.s3.send(command);
+    const bytes = await response.Body!.transformToByteArray();
+    return Buffer.from(bytes);
+  }
+
+  /**
+   * Move an object to a new key (copy, then delete the original).
+   */
+  async moveObject(sourceKey: string, destinationKey: string): Promise<void> {
+    await this.s3.send(
+      new CopyObjectCommand({
+        Bucket: this.bucket,
+        CopySource: `${this.bucket}/${encodeURIComponent(sourceKey).replace(/%2F/g, '/')}`,
+        Key: destinationKey,
+      }),
+    );
+    await this.deleteObject(sourceKey);
+    this.logger.debug(`Moved S3 object: ${sourceKey} -> ${destinationKey}`);
   }
 
   /**

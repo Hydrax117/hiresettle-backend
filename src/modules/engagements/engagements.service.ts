@@ -1,5 +1,5 @@
 import {
-  Injectable, NotFoundException, ConflictException, BadRequestException, Logger, ForbiddenException,
+  Injectable, NotFoundException, ConflictException, BadRequestException, Logger, ForbiddenException, Optional,
 } from '@nestjs/common';
 import { User, EngagementStatus, MilestoneKind, NotificationType, UserRole } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -12,6 +12,7 @@ import { EngagementNotesService } from './engagement-notes.service';
 import { EngagementImportService } from './engagement-import.service';
 import { EngagementCandidateDetailsService } from './engagement-candidate-details.service';
 import { cursorPage } from '../../common/pagination/cursor-pagination';
+import { ExchangeRateService } from '../../common/exchange-rates/exchange-rate.service';
 
 // String-literal constants for Prisma enums that may not resolve during Jest runs
 // (the generated client is mocked in unit tests).
@@ -26,6 +27,16 @@ const ENGAGEMENT_SORTABLE_FIELDS: Record<string, string> = {
   totalAmount: 'totalAmount',
 };
 
+// Statuses in which a role is still unfilled, so a passed targetStartDate makes it overdue (#470).
+const OPEN_ROLE_STATUSES: EngagementStatus[] = ['PENDING_ACCEPTANCE', 'ACTIVE', 'REPLACEMENT_REQUESTED'];
+
+/** True when the hiring deadline has passed and no candidate has been placed yet (#470). */
+function isEngagementOverdue(engagement: any, now = new Date()): boolean {
+  if (!engagement.targetStartDate || engagement.placedAt) return false;
+  if (!OPEN_ROLE_STATUSES.includes(engagement.status)) return false;
+  return new Date(engagement.targetStartDate).getTime() < now.getTime();
+}
+
 @Injectable()
 export class EngagementsService {
   private readonly logger = new Logger(EngagementsService.name);
@@ -38,6 +49,7 @@ export class EngagementsService {
     private readonly notesService: EngagementNotesService,
     private readonly importService: EngagementImportService,
     private readonly candidateDetailsService: EngagementCandidateDetailsService,
+    @Optional() private readonly exchangeRates?: ExchangeRateService,
   ) {}
 
   // ----------------------------------------------------------
@@ -45,7 +57,126 @@ export class EngagementsService {
   // ----------------------------------------------------------
 
   async create(user: User, dto: CreateEngagementDto) {
+    const { mergedData, templateVersion, milestoneData } = await this.prepareEngagement(user, dto);
 
+    // Increment template usage stats (#265)
+    if (dto.templateId) {
+      await this.prisma.engagementTemplate.update({
+        where: { id: dto.templateId },
+        data: { usageCount: { increment: 1 }, lastUsedAt: new Date() },
+      });
+    }
+
+    // Persist engagement as PENDING_ACCEPTANCE — on-chain submission happens on recruiter accept
+    const engagement = await this.prisma.engagement.create({
+      data: {
+        id: mergedData.engagementId,
+        companyAddress: mergedData.companyAddress,
+        recruiterAddress: mergedData.recruiterAddress,
+        arbiterAddress: mergedData.arbiterAddress,
+        tokenAddress: mergedData.tokenAddress,
+        totalAmount: BigInt(mergedData.totalAmount),
+        jobTitle: mergedData.jobTitle,
+        jobDescription: mergedData.jobDescription,
+        salaryRange: mergedData.salaryRange,
+        location: mergedData.location,
+        customFields: mergedData.customFields ?? undefined,
+        targetStartDate: mergedData.targetStartDate ? new Date(mergedData.targetStartDate) : null,
+        status: 'PENDING_ACCEPTANCE',
+        templateVersionId: templateVersion?.id,
+        milestones: { create: milestoneData },
+      },
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    });
+
+    this.logger.log(`Engagement invite created (PENDING_ACCEPTANCE): ${engagement.id}`);
+
+    await this.notifications.notifyUser(
+      mergedData.recruiterAddress,
+      'ENGAGEMENT_CREATED',
+      `New engagement invite: ${mergedData.jobTitle}`,
+      `You have a new engagement invite for "${mergedData.jobTitle}". Please accept or decline.`,
+      { engagementId: engagement.id },
+    );
+
+    return this.serialize(engagement);
+  }
+
+  // ----------------------------------------------------------
+  // FEE PREVIEW (#375) — cost breakdown without creating anything
+  // ----------------------------------------------------------
+
+  /**
+   * Runs the same validation as `create` and returns what the engagement will
+   * cost: the escrowed amount and platform fee per milestone (token stroops,
+   * using the company's plan fee rate) plus the Stellar network fees (XLM
+   * stroops, from the same estimate as `GET /stellar/fee-estimate`).
+   */
+  async preview(user: User, dto: CreateEngagementDto) {
+    const { mergedData, milestoneData } = await this.prepareEngagement(user, dto);
+
+    const company = await this.prisma.user.findUnique({
+      where: { id: user.id },
+      select: { plan: { select: { id: true, platformFeeBps: true } } },
+    });
+    const platformFeeBps = company?.plan?.platformFeeBps ?? 0;
+    const { sorobanFee } = await this.stellar.getFeeEstimate();
+    const networkFee = BigInt(sorobanFee);
+
+    const totalAmount = BigInt(mergedData.totalAmount);
+    const amounts = this.splitByPercent(totalAmount, milestoneData.map((m) => m.paymentPercent));
+    const platformFees = this.splitByPercent(
+      (totalAmount * BigInt(platformFeeBps)) / 10_000n,
+      milestoneData.map((m) => m.paymentPercent),
+    );
+
+    // One contract call funds the escrow; each milestone is released by its own call.
+    const milestones = milestoneData.map((m, i) => ({
+      milestoneIndex: m.milestoneIndex,
+      name: m.name,
+      kind: m.kind,
+      paymentPercent: m.paymentPercent,
+      amount: amounts[i].toString(),
+      platformFee: platformFees[i].toString(),
+      total: (amounts[i] + platformFees[i]).toString(),
+      networkFee: networkFee.toString(),
+    }));
+    const platformFee = platformFees.reduce((acc, f) => acc + f, 0n);
+    const networkFeeTotal = networkFee * BigInt(milestoneData.length + 1);
+
+    return {
+      tokenAddress: mergedData.tokenAddress,
+      plan: company?.plan?.id ?? null,
+      platformFeeBps,
+      totalAmount: totalAmount.toString(),
+      platformFee: platformFee.toString(),
+      totalCost: (totalAmount + platformFee).toString(),
+      networkFee: {
+        asset: 'XLM',
+        fundingFee: networkFee.toString(),
+        perMilestoneReleaseFee: networkFee.toString(),
+        total: networkFeeTotal.toString(),
+      },
+      milestones,
+    };
+  }
+
+  /** Split `total` by percentages; the last share absorbs rounding so the parts sum to `total`. */
+  private splitByPercent(total: bigint, percents: number[]): bigint[] {
+    let allocated = 0n;
+    return percents.map((percent, i) => {
+      if (i === percents.length - 1) return total - allocated;
+      const share = (total * BigInt(percent)) / 100n;
+      allocated += share;
+      return share;
+    });
+  }
+
+  /**
+   * Validation shared by `create` and `preview`: plan limits, token allow-list,
+   * custom fields, template merge and milestone checks. Has no side effects.
+   */
+  private async prepareEngagement(user: User, dto: CreateEngagementDto) {
     const existing = await this.prisma.engagement.findUnique({
       where: { id: dto.engagementId },
     });
@@ -103,12 +234,6 @@ export class EngagementsService {
       templateVersion = await this.prisma.engagementTemplateVersion.findUnique({
         where: { templateId_version: { templateId: template.id, version: template.currentVersion } },
       });
-
-      // Increment template usage stats (#265)
-      await this.prisma.engagementTemplate.update({
-        where: { id: template.id },
-        data: { usageCount: { increment: 1 }, lastUsedAt: new Date() },
-      });
     }
 
     // Merge template version and dto (dto overrides template)
@@ -118,6 +243,7 @@ export class EngagementsService {
       jobDescription: dto.jobDescription ?? templateVersion?.jobDescription,
       salaryRange: dto.salaryRange ?? templateVersion?.salaryRange,
       location: dto.location ?? templateVersion?.location,
+      targetStartDate: dto.targetStartDate,
       milestones: dto.milestones ?? templateVersion?.milestoneConfig?.milestones,
       retentionDays: dto.retentionDays ?? templateVersion?.milestoneConfig?.retentionDays,
     };
@@ -146,38 +272,7 @@ export class EngagementsService {
       };
     });
 
-    // Persist engagement as PENDING_ACCEPTANCE — on-chain submission happens on recruiter accept
-    const engagement = await this.prisma.engagement.create({
-      data: {
-        id: mergedData.engagementId,
-        companyAddress: mergedData.companyAddress,
-        recruiterAddress: mergedData.recruiterAddress,
-        arbiterAddress: mergedData.arbiterAddress,
-        tokenAddress: mergedData.tokenAddress,
-        totalAmount: BigInt(mergedData.totalAmount),
-        jobTitle: mergedData.jobTitle,
-        jobDescription: mergedData.jobDescription,
-        salaryRange: mergedData.salaryRange,
-        location: mergedData.location,
-        customFields: mergedData.customFields ?? undefined,
-        status: 'PENDING_ACCEPTANCE',
-        templateVersionId: templateVersion?.id,
-        milestones: { create: milestoneData },
-      },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
-    });
-
-    this.logger.log(`Engagement invite created (PENDING_ACCEPTANCE): ${engagement.id}`);
-
-    await this.notifications.notifyUser(
-      mergedData.recruiterAddress,
-      'ENGAGEMENT_CREATED',
-      `New engagement invite: ${mergedData.jobTitle}`,
-      `You have a new engagement invite for "${mergedData.jobTitle}". Please accept or decline.`,
-      { engagementId: engagement.id },
-    );
-
-    return this.serialize(engagement);
+    return { mergedData, templateVersion, milestoneData };
   }
 
   // ----------------------------------------------------------
@@ -276,6 +371,9 @@ export class EngagementsService {
 
     const currentLedger = await this.stellar.getLatestLedger();
 
+    // Funding is confirmed on-chain — freeze the asset/USD rate for stable fiat reporting (#469)
+    const fundingRateUsd = await this.fetchUsdRate(engagement.tokenAddress);
+
     // 3. Build milestone data with unlock estimates
     let retentionIdx = 0;
     const milestoneData = engagement.milestones.map((m: any, index: number) => {
@@ -309,6 +407,7 @@ export class EngagementsService {
           status: 'ACTIVE',
           txHash,
           createdLedger,
+          ...(fundingRateUsd != null ? { fundingRateUsd, fundingRateAt: new Date() } : {}),
         },
       });
 
@@ -403,10 +502,11 @@ export class EngagementsService {
     sortBy?: string;       // one of ENGAGEMENT_SORTABLE_FIELDS
     sortOrder?: string;    // 'asc' | 'desc'
     includeArchived?: boolean;
+    overdue?: boolean | string; // true → only engagements past their targetStartDate (#470)
   }) {
     const {
       companyAddress, recruiterAddress, status, search, createdFrom, createdTo, tags,
-      page = 1, limit = 20, cursor, sortBy, sortOrder, includeArchived,
+      page = 1, limit = 20, cursor, sortBy, sortOrder, includeArchived, overdue,
     } = filters;
 
     const where: any = {};
@@ -438,6 +538,15 @@ export class EngagementsService {
       if (tagList.length > 0) {
         where.tags = { hasEvery: tagList };
       }
+    }
+
+    // overdue filter (#470): deadline passed, nobody placed, role still open
+    if (overdue === true || overdue === 'true') {
+      where.AND = [
+        { targetStartDate: { lt: new Date() } },
+        { placedAt: null },
+        { status: { in: OPEN_ROLE_STATUSES } },
+      ];
     }
 
     let orderBy: Record<string, 'asc' | 'desc'> = { createdAt: 'desc' };
@@ -508,7 +617,7 @@ export class EngagementsService {
       }
     }
 
-    return this.serializeAmounts(engagement);
+    return { ...this.serializeAmounts(engagement), isOverdue: isEngagementOverdue(engagement) };
   }
 
   /**
@@ -723,6 +832,11 @@ export class EngagementsService {
         ReplacementRequested: 'REPLACEMENT_REQUESTED',
       };
 
+      // Retry the funding rate snapshot if the provider was unavailable at accept time (#469)
+      const fundingRateUsd = engagement.txHash && engagement.fundingRateUsd == null
+        ? await this.fetchUsdRate(engagement.tokenAddress)
+        : null;
+
       await this.prisma.engagement.update({
         where: { id: engagementId },
         data: {
@@ -730,6 +844,7 @@ export class EngagementsService {
           releasedAmount,
           escrowBalance,
           fundingShortfall,
+          ...(fundingRateUsd != null ? { fundingRateUsd, fundingRateAt: new Date() } : {}),
         },
       });
 
@@ -915,6 +1030,18 @@ export class EngagementsService {
     return this.importService.importFromCsv(user, file);
   }
 
+  /** Current asset/USD rate for an engagement token, or null when unknown (#469). */
+  private async fetchUsdRate(tokenAddress: string): Promise<number | null> {
+    if (!this.exchangeRates) return null;
+    try {
+      const token = this.stellar.getTokenConfig(tokenAddress);
+      return await this.exchangeRates.getRate(token.symbol, 'USD');
+    } catch (error: any) {
+      this.logger.warn(`USD rate snapshot skipped for token ${tokenAddress}: ${error?.message ?? String(error)}`);
+      return null;
+    }
+  }
+
   // ----------------------------------------------------------
   // SERIALISE HELPERS
   // ----------------------------------------------------------
@@ -925,6 +1052,7 @@ export class EngagementsService {
       totalAmount: engagement.totalAmount?.toString(),
       releasedAmount: engagement.releasedAmount?.toString(),
       escrowBalance: engagement.escrowBalance?.toString() ?? null,
+      isOverdue: isEngagementOverdue(engagement),
       milestones: engagement.milestones?.map((m: any) => ({
         ...m,
         paymentReleased: m.paymentReleased?.toString() ?? null,

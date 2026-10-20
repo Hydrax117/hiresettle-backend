@@ -78,6 +78,28 @@ export class EngagementsController {
   }
 
   /**
+   * POST /api/v1/engagements/preview
+   * Cost breakdown (platform fee + Stellar network fees) without creating anything (#375).
+   */
+  @Post('preview')
+  @UseGuards(RolesGuard)
+  @Roles(UserRole.COMPANY)
+  @RequireScopes(ApiKeyScope.ENGAGEMENTS_READ)
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Preview the full cost of an engagement before creating it (COMPANY only)' })
+  @ApiResponse({ status: 200, description: 'Cost breakdown per milestone, platform fee and network fees' })
+  @ApiResponse({ status: 400, description: 'Invalid request' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Forbidden' })
+  @ApiResponse({ status: 422, description: 'Validation failed' })
+  preview(
+    @CurrentUser() user: User,
+    @Body() dto: CreateEngagementDto,
+  ) {
+    return this.engagementsService.preview(user, dto);
+  }
+
+  /**
    * GET /api/v1/engagements
    * List with optional filters: search, status (single/multi), date range, pagination.
    */
@@ -97,6 +119,7 @@ export class EngagementsController {
   @ApiQuery({ name: 'sortBy', required: false, enum: ['createdAt', 'amount', 'status'], description: 'Field to sort by (default: createdAt)' })
   @ApiQuery({ name: 'sortOrder', required: false, enum: ['asc', 'desc'], description: 'Sort direction (default: desc)' })
   @ApiQuery({ name: 'includeArchived', required: false, type: Boolean, description: 'Include archived engagements (default: false)' })
+  @ApiQuery({ name: 'overdue', required: false, type: Boolean, description: 'true → only open engagements past their targetStartDate' })
   @ApiResponse({ status: 200, description: 'Engagements list retrieved' })
   @ApiResponse({ status: 400, description: 'Invalid sortBy or sortOrder value' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
@@ -114,6 +137,7 @@ export class EngagementsController {
     @Query('sortBy') sortBy?: string,
     @Query('sortOrder') sortOrder?: string,
     @Query('includeArchived') includeArchived?: boolean,
+    @Query('overdue') overdue?: string,
   ) {
     return this.engagementsService.findAll({
       companyAddress,
@@ -129,6 +153,7 @@ export class EngagementsController {
       sortBy,
       sortOrder,
       includeArchived,
+      overdue,
     });
   }
 

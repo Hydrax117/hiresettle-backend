@@ -15,6 +15,7 @@ import { ActivityFeedService } from './activity-feed.service';
 import { IdempotencyModule } from '../../common/idempotency/idempotency.module';
 import { IdempotencyInterceptor } from '../../common/interceptors/idempotency.interceptor';
 import { AuthModule } from '../auth/auth.module';
+import { ExchangeRatesModule } from '../../common/exchange-rates/exchange-rates.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { AuthModule } from '../auth/auth.module';
     PrismaModule,
     IdempotencyModule,
     AuthModule,
+    ExchangeRatesModule,
     MulterModule.register({ limits: { fileSize: 5 * 1024 * 1024 } }), // max 5 MB CSV
   ],
   controllers: [EngagementsController],

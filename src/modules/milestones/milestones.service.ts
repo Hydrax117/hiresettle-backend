@@ -1,12 +1,13 @@
-import { Injectable, NotFoundException, Logger, UnprocessableEntityException, ForbiddenException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, Logger, UnprocessableEntityException, ForbiddenException, BadRequestException, ConflictException, Optional } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { S3Service } from '../../common/s3/s3.service';
-import { DisputeOutcome, MilestoneKind, MilestoneStatus, NotificationType } from '@prisma/client';
+import { DisputeOutcome, FileScanStatus, MilestoneKind, MilestoneStatus, NotificationType } from '@prisma/client';
 import { NotificationsService } from '../notifications/notifications.service';
 import { DisputeActor, DisputesService } from '../disputes/disputes.service';
 import { BulkMilestoneItemDto } from './dto/bulk-create-milestones.dto';
 import { ProofVersionsService } from './proof-versions.service';
+import { FileScanService } from '../../common/file-scan/file-scan.service';
 
 @Injectable()
 export class MilestonesService {
@@ -18,6 +19,7 @@ export class MilestonesService {
     private readonly notifications: NotificationsService,
     private readonly s3: S3Service,
     private readonly disputes: DisputesService,
+    @Optional() private readonly fileScan?: FileScanService,
   ) {}
 
   async findByEngagement(engagementId: string) {
@@ -795,8 +797,8 @@ export class MilestonesService {
 
     const key = `evidence/${engagementId}/${milestoneIndex}/${user.id}/${Date.now()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     await this.s3.uploadFile(key, file.buffer, file.mimetype);
-    const s3Url = await this.s3.getPresignedUrl(key);
 
+    // No download URL until the malware scan marks the file CLEAN (#471).
     const evidence = await this.prisma.disputeEvidence.create({
       data: {
         milestoneId: milestone.id,
@@ -805,11 +807,51 @@ export class MilestonesService {
         fileSize: file.size,
         mimeType: file.mimetype,
         s3Path: key,
-        s3Url,
+        scanStatus: FileScanStatus.PENDING,
       },
     });
+    await this.fileScan?.enqueue('evidence', evidence.id);
 
-    return { id: evidence.id, fileName: evidence.fileName, s3Url };
+    return { id: evidence.id, fileName: evidence.fileName, scanStatus: evidence.scanStatus, s3Url: null };
+  }
+
+  /**
+   * Presigned download URL for an evidence file. Only files the malware scan
+   * marked CLEAN can be downloaded (#471).
+   */
+  async getEvidenceDownloadUrl(
+    engagementId: string,
+    milestoneIndex: number,
+    evidenceId: string,
+    user: any,
+  ) {
+    const evidence = await this.prisma.disputeEvidence.findUnique({
+      where: { id: evidenceId },
+      include: { milestone: { include: { engagement: true } } },
+    });
+    if (
+      !evidence ||
+      evidence.milestone.engagementId !== engagementId ||
+      evidence.milestone.milestoneIndex !== milestoneIndex
+    ) {
+      throw new NotFoundException(`Evidence ${evidenceId} not found on milestone ${milestoneIndex}`);
+    }
+    this.checkPartyAccess(evidence.milestone.engagement, user);
+
+    if (evidence.scanStatus !== FileScanStatus.CLEAN) {
+      throw new ConflictException(
+        evidence.scanStatus === FileScanStatus.INFECTED
+          ? 'This file failed malware scanning and has been quarantined'
+          : 'This file is still being scanned for malware; try again shortly',
+      );
+    }
+
+    return {
+      id: evidence.id,
+      fileName: evidence.fileName,
+      mimeType: evidence.mimeType,
+      url: await this.s3.getPresignedUrl(evidence.s3Path),
+    };
   }
 
   async updateMilestoneStatusByAdmin(

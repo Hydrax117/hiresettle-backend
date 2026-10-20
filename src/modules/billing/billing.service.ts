@@ -249,7 +249,7 @@ export class BillingService {
 
         // Optional fiat-equivalent totals, converted per token.
         const fiatValues = fiatCurrency
-          ? await this.toFiatValues(engagement.tokenAddress, escrowed, released, fiatCurrency)
+          ? await this.toFiatValues(engagement.tokenAddress, escrowed, released, fiatCurrency, engagement.fundingRateUsd)
           : { escrowedFiat: null, releasedFiat: null, tokenSymbol: null };
 
         if (fiatValues.escrowedFiat != null) {
@@ -295,10 +295,15 @@ export class BillingService {
     escrowed: bigint,
     released: bigint,
     fiat: string,
+    fundingRateUsd?: number | null,
   ): Promise<{ escrowedFiat: number | null; releasedFiat: number | null; tokenSymbol: string | null }> {
     try {
       const token = this.stellar.getTokenConfig(tokenAddress);
-      const rate = await this.exchangeRates.getRate(token.symbol, fiat);
+      // Funded engagements use the USD rate snapshotted at funding time so
+      // reports don't drift with the market (#469).
+      const rate = fiat === "USD" && fundingRateUsd != null
+        ? fundingRateUsd
+        : await this.exchangeRates.getRate(token.symbol, fiat);
       if (rate == null) {
         return { escrowedFiat: null, releasedFiat: null, tokenSymbol: token.symbol };
       }
