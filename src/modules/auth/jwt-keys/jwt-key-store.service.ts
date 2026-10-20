@@ -99,7 +99,7 @@ export class JwtKeyStore {
 
   /** Key used to sign new tokens. */
   signingKey(): KeyObject | string {
-    if (this.activeKey) return this.activeKey.privateKey;
+    if (this.activeKey) return this.activeKey.privateKey!;
     if (!this.legacySecret) throw new Error('JWT_SECRET is not configured');
     return this.legacySecret;
   }
@@ -211,7 +211,7 @@ export class JwtKeyStore {
     const privateKey = entry.privateKey ? createPrivateKey(normalizePem(entry.privateKey)) : null;
     const publicKey = entry.publicKey
       ? createPublicKey(normalizePem(entry.publicKey))
-      : createPublicKey(privateKey);
+      : createPublicKey(privateKey!);
 
     const modulusLength = publicKey.asymmetricKeyDetails?.modulusLength ?? 0;
     if (publicKey.asymmetricKeyType !== 'rsa' || modulusLength < MIN_RSA_MODULUS_BITS) {

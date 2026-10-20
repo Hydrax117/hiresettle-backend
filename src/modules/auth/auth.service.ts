@@ -7,49 +7,55 @@ import {
   UnauthorizedException,
   HttpException,
   HttpStatus,
-} from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
-import { JwtService } from "@nestjs/jwt";
-import { Prisma, User } from "@prisma/client";
-import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash } from "crypto";
-import { promisify } from "util";
-import { PrismaService } from "../../common/prisma/prisma.service";
-import { StellarService } from "../../common/stellar/stellar.service";
-import { SecurityEventsService } from "../../common/security-events/security-events.service";
-import { PasswordPolicyService } from "../../common/password/password-policy.service";
-import { HibpService } from "../../common/hibp/hibp.service";
-import { LoginDto } from "./dto/login.dto";
-import { RegisterDto } from "./dto/register.dto";
-import { TwoFactorService } from "./two-factor.service";
-import { SessionService } from "./session.service";
-import { WalletAuthService } from "./wallet-auth.service";
-import { OAuthService } from "./oauth.service";
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
+import { Prisma, SecurityEventAction, User, UserRole } from '@prisma/client';
+import { randomBytes, scrypt as scryptCallback, timingSafeEqual, createHash } from 'crypto';
+import { promisify } from 'util';
+import { TOTP } from 'otpauth';
+import { PrismaService } from '../../common/prisma/prisma.service';
+import { StellarService } from '../../common/stellar/stellar.service';
+import { SecurityEventsService } from '../../common/security-events/security-events.service';
+import { PasswordPolicyService } from '../../common/password/password-policy.service';
+import { LoginDto } from './dto/login.dto';
+import { RegisterDto } from './dto/register.dto';
+import { Keypair } from '@stellar/stellar-sdk';
+
+// WebAuthn stubs — @simplewebauthn/server is not yet installed.
+// These are typed as `any` so the rest of the file compiles while the
+// feature is still under development.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const generateRegistrationOptions: any = () => { throw new Error('WebAuthn not implemented'); };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const verifyRegistrationResponse: any = () => { throw new Error('WebAuthn not implemented'); };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const generateAuthenticationOptions: any = () => { throw new Error('WebAuthn not implemented'); };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const verifyAuthenticationResponse: any = () => { throw new Error('WebAuthn not implemented'); };
 
 const scrypt = promisify(scryptCallback);
 const PASSWORD_KEY_LENGTH = 64;
+const REFRESH_TOKEN_DAYS = 7;
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MINUTES = 15;
 const IMPERSONATION_TOKEN_TTL_SECONDS = 5 * 60;
 
-type AuthUser = Omit<User, "passwordHash" | "webhookSecret">;
+type AuthUser = Omit<User, 'passwordHash' | 'webhookSecret'>;
 
 export interface RequestMeta {
   ip?: string;
   userAgent?: string;
 }
 
-// String literals — SecurityEventAction enum may not resolve in Jest mock env
-const ACTION_LOGIN_SUCCESS = "LOGIN_SUCCESS" as const;
-const ACTION_LOGIN_FAILURE = "LOGIN_FAILURE" as const;
-const ACTION_IMPERSONATION_ISSUED = "IMPERSONATION_ISSUED" as const;
-const ACTION_LOGOUT = "LOGOUT" as const;
-
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
-  // Rebind challenges keyed by userId (#357)
-  private readonly rebindChallenges = new Map<string, { nonce: string; expiresAt: number }>();
+  // Kept for the existing nonce endpoint while email/password auth becomes primary.
+  private readonly nonces = new Map<string, { nonce: string; expiresAt: number }>();
+  private readonly regChallenges = new Map<string, string>(); // keyed by userId
+  private readonly authChallenges = new Map<string, string>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -58,54 +64,41 @@ export class AuthService {
     private readonly stellar: StellarService,
     private readonly securityEvents: SecurityEventsService,
     private readonly passwordPolicy: PasswordPolicyService,
-    private readonly hibp: HibpService,
-    private readonly twoFactor: TwoFactorService,
-    private readonly sessionService: SessionService,
-    private readonly walletAuth: WalletAuthService,
-    private readonly oauthService: OAuthService,
   ) {}
 
-  // ── Nonce (delegated to WalletAuthService) ────────────────────────────────
-
   generateNonce(stellarAddress: string): string {
-    return this.walletAuth.generateNonce(stellarAddress);
-  }
-
-  consumeNonce(stellarAddress: string, nonce: string): boolean {
-    return this.walletAuth.consumeNonce(stellarAddress, nonce);
-  }
-
-  // ── Rebind challenges (#357) ──────────────────────────────────────────────
-
-  generateRebindChallenge(userId: string): string {
-    const nonce = `hiresettle-rebind:${userId}:${Date.now()}:${randomBytes(16).toString("hex")}`;
-    this.rebindChallenges.set(userId, { nonce, expiresAt: Date.now() + 10 * 60 * 1000 });
+    const nonce = `hiresettle:${stellarAddress}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    this.nonces.set(stellarAddress, {
+      nonce,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
     return nonce;
   }
 
-  consumeRebindChallenge(userId: string, nonce: string): boolean {
-    const entry = this.rebindChallenges.get(userId);
+  /** Consume and validate a challenge nonce for a Stellar address. */
+  consumeNonce(stellarAddress: string, nonce: string): boolean {
+    const entry = this.nonces.get(stellarAddress);
     if (!entry) return false;
-    if (entry.expiresAt < Date.now()) { this.rebindChallenges.delete(userId); return false; }
+    if (entry.expiresAt < Date.now()) {
+      this.nonces.delete(stellarAddress);
+      return false;
+    }
     if (entry.nonce !== nonce) return false;
-    this.rebindChallenges.delete(userId);
+    this.nonces.delete(stellarAddress);
     return true;
   }
 
-  // ── Registration ──────────────────────────────────────────────────────────
-
   async register(dto: RegisterDto) {
     this.passwordPolicy.validate(dto.password);
-    await this.checkHibp(dto.password);
     const email = dto.email.toLowerCase();
     const passwordHash = await this.hashPassword(dto.password);
 
     if (dto.stellarAddress) {
-      const skipAccountValidation = this.config.get<boolean>("SKIP_ACCOUNT_VALIDATION");
+      const skipAccountValidation = this.config.get<boolean>('SKIP_ACCOUNT_VALIDATION');
       if (!skipAccountValidation) {
         const accountExists = await this.stellar.accountExists(dto.stellarAddress);
         if (!accountExists) {
-          throw new BadRequestException("Stellar address does not exist or is not funded.");
+          throw new BadRequestException('Stellar address does not exist or is not funded.');
         }
       }
     }
@@ -123,20 +116,17 @@ export class AuthService {
       });
 
       this.logger.log(`User registered: ${email}`);
-      return this.sessionService.issueTokenPair(user);
+      return this.issueTokenPair(user);
     } catch (error) {
       if (
-        error?.code === "P2002" &&
-        (error?.name === "PrismaClientKnownRequestError" ||
-          (Prisma.PrismaClientKnownRequestError && error instanceof Prisma.PrismaClientKnownRequestError))
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
       ) {
-        throw new ConflictException("Email or Stellar address is already registered");
+        throw new ConflictException('Email or Stellar address is already registered');
       }
       throw error;
     }
   }
-
-  // ── Login ─────────────────────────────────────────────────────────────────
 
   async login(dto: LoginDto, meta: RequestMeta = {}) {
     const email = dto.email.toLowerCase();
@@ -144,138 +134,251 @@ export class AuthService {
 
     if (!user?.passwordHash || !(await this.verifyPassword(dto.password, user.passwordHash))) {
       await this.handleFailedLogin(user?.id, meta);
-      throw new UnauthorizedException("Invalid email or password");
+      throw new UnauthorizedException('Invalid email or password');
     }
 
     if (user.deactivatedAt) {
-      await this.logSecurityEvent(ACTION_LOGIN_FAILURE, user.id, meta);
-      throw new ForbiddenException("Your account has been deactivated. Please contact an administrator.");
+      await this.logSecurityEvent(SecurityEventAction.LOGIN_FAILURE, user.id, meta);
+      throw new ForbiddenException('Your account has been deactivated. Please contact an administrator.');
     }
 
     if (user.lockedUntil && user.lockedUntil > new Date()) {
-      await this.logSecurityEvent(ACTION_LOGIN_FAILURE, user.id, meta);
+      await this.logSecurityEvent(SecurityEventAction.LOGIN_FAILURE, user.id, meta);
       const retryAfterSeconds = Math.ceil((user.lockedUntil.getTime() - Date.now()) / 1000);
       throw new HttpException(
-        { message: "Account temporarily locked due to repeated failed login attempts", retryAfter: retryAfterSeconds },
+        {
+          message: 'Account temporarily locked due to repeated failed login attempts',
+          retryAfter: retryAfterSeconds,
+        },
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
 
+    // Check if 2FA is enabled
     if (user.totpEnabled) {
-      const trustedDeviceSkip =
-        dto.trustedDeviceToken &&
-        (await this.twoFactor.verifyTrustedDeviceToken(user.id, dto.trustedDeviceToken));
+      if (!dto.totpCode) {
+        throw new UnauthorizedException('TOTP code required for 2FA-enabled account');
+      }
 
-      if (!trustedDeviceSkip) {
-        if (!dto.totpCode && !dto.recoveryCode) {
-          throw new UnauthorizedException("TOTP code or recovery code required for 2FA-enabled account");
-        }
-
-        if (dto.recoveryCode) {
-          const consumed = await this.twoFactor.consumeRecoveryCode(user.id, dto.recoveryCode);
-          if (!consumed) {
-            await this.handleFailedLogin(user.id, meta);
-            throw new UnauthorizedException("Invalid or already-used recovery code");
-          }
-        } else {
-          if (!this.twoFactor.verifyTotpCode(user.totpSecret!, dto.totpCode!)) {
-            await this.handleFailedLogin(user.id, meta);
-            throw new UnauthorizedException("Invalid TOTP code");
-          }
-        }
+      const isValid = this.verifyTotpCode(user.totpSecret!, dto.totpCode);
+      if (!isValid) {
+        await this.handleFailedLogin(user.id, meta);
+        throw new UnauthorizedException('Invalid TOTP code');
       }
     }
 
     await this.resetFailedAttempts(user.id);
     this.logger.log(`User logged in: ${email}`);
-    await this.logSecurityEvent(ACTION_LOGIN_SUCCESS, user.id, meta);
-
-    const tokenPair = await this.sessionService.issueTokenPair(user);
-
-    if (user.totpEnabled && dto.trustDevice) {
-      const trustedDeviceToken = await this.twoFactor.issueTrustedDeviceToken(user.id, meta.userAgent);
-      return { ...tokenPair, trustedDeviceToken };
-    }
-
-    return tokenPair;
+    await this.logSecurityEvent(SecurityEventAction.LOGIN_SUCCESS, user.id, meta);
+    return this.issueTokenPair(user);
   }
 
-  /** Backward-compatible alias kept for existing controller routes. */
+  // Backward-compatible alias kept for existing controller routes
   walletLogin(dto: LoginDto, meta: RequestMeta = {}) {
     return this.login(dto, meta);
   }
 
-  // ── OAuth (delegated) ─────────────────────────────────────────────────────
+  /**
+   * Google OAuth2 login: link to an existing user by email when possible,
+   * otherwise create a COMPANY user. Issues the same JWT pair as password login.
+   */
+  async loginWithGoogle(
+    profile: { googleId: string; email: string; name?: string | null },
+    meta: RequestMeta = {},
+  ) {
+    const email = profile.email.toLowerCase();
+    let user = await this.prisma.user.findFirst({
+      where: {
+        OR: [{ googleId: profile.googleId }, { email }],
+      },
+    });
 
-  loginWithGoogle(profile: { googleId: string; email: string; name?: string | null }, meta: RequestMeta = {}) {
-    return this.oauthService.loginWithGoogle(profile, meta);
+    if (user) {
+      if (user.deactivatedAt || user.deletedAt) {
+        await this.logSecurityEvent(SecurityEventAction.LOGIN_FAILURE, user.id, meta);
+        throw new ForbiddenException('Your account has been deactivated. Please contact an administrator.');
+      }
+
+      if (!user.googleId) {
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: { googleId: profile.googleId },
+        });
+      } else if (user.googleId !== profile.googleId && user.email === email) {
+        // Email match but different googleId — still allow login via email link
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: { googleId: profile.googleId },
+        });
+      }
+    } else {
+      user = await this.prisma.user.create({
+        data: {
+          email,
+          googleId: profile.googleId,
+          name: profile.name ?? undefined,
+          role: UserRole.COMPANY,
+        },
+      });
+      this.logger.log(`User registered via Google OAuth: ${email}`);
+    }
+
+    await this.resetFailedAttempts(user.id);
+    await this.logSecurityEvent(SecurityEventAction.LOGIN_SUCCESS, user.id, meta);
+    return this.issueTokenPair(user);
   }
 
+  /** Build the Google OAuth2 authorization URL (authorization-code flow). */
   getGoogleAuthUrl(state: string): string {
-    return this.oauthService.getGoogleAuthUrl(state);
+    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID');
+    const callbackUrl = this.config.get<string>('GOOGLE_CALLBACK_URL');
+    if (!clientId || !callbackUrl) {
+      throw new BadRequestException('Google OAuth is not configured');
+    }
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: callbackUrl,
+      response_type: 'code',
+      scope: 'openid email profile',
+      access_type: 'online',
+      include_granted_scopes: 'true',
+      state,
+      prompt: 'select_account',
+    });
+
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
   }
 
-  exchangeGoogleCode(code: string) {
-    return this.oauthService.exchangeGoogleCode(code);
+  /** Exchange an authorization code for Google profile info. */
+  async exchangeGoogleCode(code: string): Promise<{ googleId: string; email: string; name?: string | null }> {
+    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID');
+    const clientSecret = this.config.get<string>('GOOGLE_CLIENT_SECRET');
+    const callbackUrl = this.config.get<string>('GOOGLE_CALLBACK_URL');
+    if (!clientId || !clientSecret || !callbackUrl) {
+      throw new BadRequestException('Google OAuth is not configured');
+    }
+
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: clientId,
+        client_secret: clientSecret,
+        redirect_uri: callbackUrl,
+        grant_type: 'authorization_code',
+      }),
+    });
+
+    if (!tokenRes.ok) {
+      this.logger.warn(`Google token exchange failed: ${tokenRes.status}`);
+      throw new UnauthorizedException('Google OAuth token exchange failed');
+    }
+
+    const tokenJson = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenJson.access_token) {
+      throw new UnauthorizedException('Google OAuth token exchange failed');
+    }
+
+    const profileRes = await fetch('https://openidconnect.googleapis.com/v1/userinfo', {
+      headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+    });
+
+    if (!profileRes.ok) {
+      throw new UnauthorizedException('Failed to fetch Google user profile');
+    }
+
+    const profile = (await profileRes.json()) as {
+      sub?: string;
+      email?: string;
+      email_verified?: boolean;
+      name?: string;
+    };
+
+    if (!profile.sub || !profile.email) {
+      throw new UnauthorizedException('Google account did not return a verified email');
+    }
+
+    if (profile.email_verified === false) {
+      throw new UnauthorizedException('Google email is not verified');
+    }
+
+    return {
+      googleId: profile.sub,
+      email: profile.email,
+      name: profile.name ?? null,
+    };
   }
 
-  // ── Sessions (delegated) ──────────────────────────────────────────────────
+  async refresh(refreshToken: string) {
+    const tokenHash = this.hashRefreshToken(refreshToken);
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
 
-  refresh(refreshToken: string) {
-    return this.sessionService.refresh(refreshToken);
+    if (!stored) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    const now = new Date();
+
+    if (stored.consumedAt) {
+      await this.revokeFamily(stored.familyId);
+      throw new UnauthorizedException('Refresh token reuse detected');
+    }
+
+    if (stored.revokedAt || stored.expiresAt <= now) {
+      throw new UnauthorizedException('Refresh token is no longer valid');
+    }
+
+    const nextRefreshToken = await this.signRefreshToken(stored.user, stored.familyId);
+    const nextRefreshTokenHash = this.hashRefreshToken(nextRefreshToken);
+    const nextExpiresAt = this.refreshExpiryDate();
+
+    await this.prisma.$transaction(async (tx) => {
+      const consumed = await tx.refreshToken.updateMany({
+        where: { id: stored.id, consumedAt: null, revokedAt: null },
+        data: { consumedAt: now },
+      });
+
+      if (consumed.count !== 1) {
+        await tx.refreshToken.updateMany({
+          where: { familyId: stored.familyId, revokedAt: null },
+          data: { revokedAt: now },
+        });
+        throw new UnauthorizedException('Refresh token reuse detected');
+      }
+
+      await tx.refreshToken.create({
+        data: {
+          userId: stored.userId,
+          tokenHash: nextRefreshTokenHash,
+          familyId: stored.familyId,
+          expiresAt: nextExpiresAt,
+        },
+      });
+    });
+
+    return {
+      accessToken: this.signAccessToken(stored.user),
+      refreshToken: nextRefreshToken,
+      user: this.sanitizeUser(stored.user),
+    };
   }
 
-  logout(refreshToken: string, meta: RequestMeta = {}) {
-    return this.sessionService.logout(refreshToken, meta);
-  }
-
-  getSessions(userId: string) {
-    return this.sessionService.getSessions(userId);
-  }
-
-  revokeSession(sessionId: string, userId: string, currentRefreshToken?: string) {
-    return this.sessionService.revokeSession(sessionId, userId, currentRefreshToken);
-  }
-
-  // ── 2FA (delegated) ───────────────────────────────────────────────────────
-
-  generateTotpSecret(userId: string) {
-    return this.twoFactor.generateTotpSecret(userId);
-  }
-
-  enableTotp(userId: string, code: string) {
-    return this.twoFactor.enableTotp(userId, code);
-  }
-
-  disableTotp(userId: string, code: string) {
-    return this.twoFactor.disableTotp(userId, code);
-  }
-
-  regenerateRecoveryCodes(userId: string, totpCode: string) {
-    return this.twoFactor.regenerateRecoveryCodes(userId, totpCode);
-  }
-
-  // ── Trusted devices (delegated) ───────────────────────────────────────────
-
-  issueTrustedDeviceToken(userId: string, userAgent?: string) {
-    return this.twoFactor.issueTrustedDeviceToken(userId, userAgent);
-  }
-
-  listTrustedDevices(userId: string) {
-    return this.twoFactor.listTrustedDevices(userId);
-  }
-
-  revokeTrustedDevice(deviceId: string, userId: string) {
-    return this.twoFactor.revokeTrustedDevice(deviceId, userId);
-  }
-
-  // ── Impersonation ─────────────────────────────────────────────────────────
-
-  async issueImpersonationToken(adminId: string, targetUserId: string, meta: RequestMeta = {}) {
-    const target = await this.prisma.user.findUnique({ where: { id: targetUserId } });
+  async issueImpersonationToken(
+    adminId: string,
+    targetUserId: string,
+    meta: RequestMeta = {},
+  ) {
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+    });
 
     if (!target || target.deletedAt || target.deactivatedAt) {
-      throw new ForbiddenException("User is not available for impersonation");
+      throw new ForbiddenException('User is not available for impersonation');
     }
 
     const accessToken = this.jwt.sign(
@@ -284,7 +387,7 @@ export class AuthService {
         email: target.email,
         stellarAddress: target.stellarAddress,
         role: target.role,
-        type: "access",
+        type: 'access',
         impersonated: true,
         impersonatorId: adminId,
       },
@@ -295,143 +398,333 @@ export class AuthService {
       userId: target.id,
       actorId: adminId,
       targetUserId: target.id,
-      action: ACTION_IMPERSONATION_ISSUED,
+      action: SecurityEventAction.IMPERSONATION_ISSUED,
       ip: meta.ip,
       userAgent: meta.userAgent,
     });
 
-    return { accessToken, expiresIn: IMPERSONATION_TOKEN_TTL_SECONDS, user: this.sanitizeUser(target) };
+    return {
+      accessToken,
+      expiresIn: IMPERSONATION_TOKEN_TTL_SECONDS,
+      user: this.sanitizeUser(target),
+    };
   }
 
-  // ── Profile ───────────────────────────────────────────────────────────────
+  async logout(refreshToken: string, meta: RequestMeta = {}) {
+    const tokenHash = this.hashRefreshToken(refreshToken);
+    const stored = await this.prisma.refreshToken.findUnique({ where: { tokenHash } });
+
+    if (stored && !stored.revokedAt) {
+      await this.prisma.refreshToken.update({
+        where: { id: stored.id },
+        data: { revokedAt: new Date() },
+      });
+    }
+
+    await this.logSecurityEvent(SecurityEventAction.LOGOUT, stored?.userId, meta);
+    return { revoked: true };
+  }
 
   async updateProfile(userId: string, dto: any): Promise<AuthUser & { webhookSecret?: string }> {
     const existing = await this.prisma.user.findUnique({ where: { id: userId } });
 
+    // Generate a signing secret the first time a webhook subscription is created.
     const isNewWebhookSubscription = !!dto.webhookUrl && !existing?.webhookUrl;
-    const webhookSecret = isNewWebhookSubscription ? randomBytes(32).toString("hex") : undefined;
+    const webhookSecret = isNewWebhookSubscription ? randomBytes(32).toString('hex') : undefined;
 
     const updated = await this.prisma.user.update({
       where: { id: userId },
       data: {
         ...(dto.name !== undefined ? { name: dto.name } : {}),
         ...(dto.company !== undefined ? { company: dto.company } : {}),
-        ...(dto.timezone !== undefined ? { timezone: dto.timezone } : {}),
         ...(dto.webhookUrl !== undefined ? { webhookUrl: dto.webhookUrl } : {}),
         ...(webhookSecret ? { webhookSecret } : {}),
       },
     });
 
     const safeUser = this.sanitizeUser(updated);
+    // Returned once, at creation time — never persisted in a response again.
     return webhookSecret ? { ...safeUser, webhookSecret } : safeUser;
   }
 
-  async resetPassword(userId: string, currentPassword: string, newPassword: string) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user || !user.passwordHash) {
-      throw new BadRequestException("User not found or password login not available");
+  async getSessions(userId: string) {
+    const now = new Date();
+    const sessions = await this.prisma.refreshToken.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        expiresAt: { gt: now },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return sessions.map((session) => ({
+      id: session.id,
+      familyId: session.familyId,
+      createdAt: session.createdAt,
+      expiresAt: session.expiresAt,
+      isCurrent: session.consumedAt === null,
+    }));
+  }
+
+  async revokeSession(sessionId: string, userId: string, currentRefreshToken?: string) {
+    const session = await this.prisma.refreshToken.findUnique({
+      where: { id: sessionId },
+    });
+
+    if (!session) {
+      throw new BadRequestException('Session not found');
     }
 
-    const currentValid = await this.verifyPassword(currentPassword, user.passwordHash);
-    if (!currentValid) throw new UnauthorizedException("Current password is incorrect");
+    if (session.userId !== userId) {
+      throw new ForbiddenException('You can only revoke your own sessions');
+    }
 
-    this.passwordPolicy.validate(newPassword);
-    await this.checkHibp(newPassword);
+    if (session.revokedAt) {
+      throw new BadRequestException('Session already revoked');
+    }
 
-    const newHash = await this.hashPassword(newPassword);
-    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash: newHash } });
-
-    // Revoke all trusted devices after password change
-    await this.prisma.trustedDevice.updateMany({
-      where: { userId, revokedAt: null },
+    await this.prisma.refreshToken.update({
+      where: { id: sessionId },
       data: { revokedAt: new Date() },
     });
 
-    this.logger.log(`Password changed for user: ${userId}`);
-    return { updated: true };
-  }
-
-  // ── Login history (#355) ──────────────────────────────────────────────────
-
-  async getLoginHistory(userId: string, page: number = 1, limit: number = 20) {
-    const HISTORY_WINDOW_DAYS = 90;
-    const from = new Date(Date.now() - HISTORY_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-
-    const [data, total] = await this.prisma.$transaction([
-      this.prisma.securityEvent.findMany({
-        where: { userId, createdAt: { gte: from } },
-        orderBy: { createdAt: "desc" },
-        skip: (page - 1) * limit,
-        take: limit,
-        select: { id: true, action: true, ip: true, userAgent: true, createdAt: true },
-      }),
-      this.prisma.securityEvent.count({ where: { userId, createdAt: { gte: from } } }),
-    ]);
-
-    const events = data.map((e) => ({
-      id: e.id,
-      action: e.action,
-      success: e.action !== ACTION_LOGIN_FAILURE,
-      ip: e.ip ?? null,
-      userAgent: e.userAgent ?? null,
-      createdAt: e.createdAt,
-    }));
-
-    return { data: events, meta: { total, page, limit, windowDays: HISTORY_WINDOW_DAYS } };
-  }
-
-  // ── HIBP breach check ─────────────────────────────────────────────────────
-
-  private async checkHibp(password: string): Promise<void> {
-    const enabled = this.config.get<string>("HIBP_CHECK_ENABLED", "true");
-    if (enabled === "false" || enabled === "0") return;
-
-    let breached: boolean;
-    try {
-      breached = await this.hibp.isBreached(password);
-    } catch (err: any) {
-      this.logger.warn(`HIBP check failed unexpectedly: ${err?.message ?? err} — skipping`);
-      return;
+    // Check if the revoked session is the current one
+    let isCurrentSession = false;
+    if (currentRefreshToken) {
+      const currentTokenHash = this.hashRefreshToken(currentRefreshToken);
+      isCurrentSession = session.tokenHash === currentTokenHash;
     }
 
-    if (breached) {
-      throw new BadRequestException(
-        "This password has appeared in a known data breach. Please choose a different password.",
-      );
-    }
+    return { revoked: true, isCurrentSession };
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
+  async generateTotpSecret(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new BadRequestException('User not found');
+    }
 
-  sanitizeUser(user: User): AuthUser {
-    const { passwordHash, webhookSecret, ...safeUser } = user as any;
-    return safeUser;
+    if (user.totpEnabled) {
+      throw new BadRequestException('2FA is already enabled');
+    }
+
+    // Generate a random base32 secret
+    const secretBytes = randomBytes(20);
+    const base32Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let secret = '';
+    for (let i = 0; i < secretBytes.length; i += 5) {
+      const chunk = secretBytes.slice(i, i + 5);
+      secret += this.base32Encode(chunk);
+    }
+
+    const totp = new TOTP({
+      issuer: 'HireSettle',
+      label: user.email || user.stellarAddress || userId,
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+      secret,
+    });
+
+    const otpauthUrl = totp.toString();
+
+    // Store the secret temporarily (not enabled yet)
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { totpSecret: secret },
+    });
+
+    return {
+      secret,
+      otpauthUrl,
+    };
+  }
+
+  private base32Encode(bytes: Buffer): string {
+    const base32Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = 0;
+    let value = 0;
+    let output = '';
+
+    for (let i = 0; i < bytes.length; i++) {
+      value = (value << 8) | bytes[i];
+      bits += 8;
+
+      while (bits >= 5) {
+        output += base32Chars[(value >>> (bits - 5)) & 31];
+        bits -= 5;
+      }
+    }
+
+    if (bits > 0) {
+      output += base32Chars[(value << (5 - bits)) & 31];
+    }
+
+    return output;
+  }
+
+  async enableTotp(userId: string, code: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || !user.totpSecret) {
+      throw new BadRequestException('TOTP secret not found. Please generate a secret first.');
+    }
+
+    if (user.totpEnabled) {
+      throw new BadRequestException('2FA is already enabled');
+    }
+
+    const isValid = this.verifyTotpCode(user.totpSecret, code);
+    if (!isValid) {
+      throw new UnauthorizedException('Invalid TOTP code');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { totpEnabled: true },
+    });
+
+    this.logger.log(`2FA enabled for user: ${user.email || userId}`);
+    return { enabled: true };
+  }
+
+  async disableTotp(userId: string, code: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) {
+      throw new BadRequestException('User not found');
+    }
+
+    if (!user.totpEnabled) {
+      throw new BadRequestException('2FA is not enabled');
+    }
+
+    const isValid = this.verifyTotpCode(user.totpSecret!, code);
+    if (!isValid) {
+      throw new UnauthorizedException('Invalid TOTP code');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        totpSecret: null,
+        totpEnabled: false,
+      },
+    });
+
+    this.logger.log(`2FA disabled for user: ${user.email || userId}`);
+    return { disabled: true };
+  }
+
+  private verifyTotpCode(secret: string, code: string): boolean {
+    const totp = new TOTP({
+      secret,
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+    });
+
+    const delta = totp.validate({ token: code, window: 1 });
+    return delta !== null;
+  }
+
+  private async issueTokenPair(user: User) {
+    const familyId = randomBytes(24).toString('hex');
+    const refreshToken = await this.signRefreshToken(user, familyId);
+
+    await this.prisma.refreshToken.create({
+      data: {
+        userId: user.id,
+        tokenHash: this.hashRefreshToken(refreshToken),
+        familyId,
+        expiresAt: this.refreshExpiryDate(),
+      },
+    });
+
+    return {
+      accessToken: this.signAccessToken(user),
+      refreshToken,
+      user: this.sanitizeUser(user),
+    };
+  }
+
+  private signAccessToken(user: User): string {
+    return this.jwt.sign(
+      {
+        sub: user.id,
+        email: user.email,
+        stellarAddress: user.stellarAddress,
+        role: user.role,
+        type: 'access',
+      },
+      { expiresIn: this.config.get<string>('JWT_ACCESS_EXPIRES_IN', '15m') },
+    );
+  }
+
+  private async signRefreshToken(user: User, familyId: string): Promise<string> {
+    return this.jwt.signAsync(
+      { sub: user.id, familyId, type: 'refresh' },
+      { expiresIn: this.config.get<string>('JWT_REFRESH_EXPIRES_IN', '7d') },
+    );
+  }
+
+  private refreshExpiryDate(): Date {
+    const days = this.config.get<number>('JWT_REFRESH_EXPIRES_DAYS', REFRESH_TOKEN_DAYS);
+    return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+  }
+
+  private hashRefreshToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
   }
 
   private async hashPassword(password: string): Promise<string> {
-    const salt = randomBytes(16).toString("hex");
+    const salt = randomBytes(16).toString('hex');
     const derivedKey = (await scrypt(password, salt, PASSWORD_KEY_LENGTH)) as Buffer;
-    return `scrypt:${salt}:${derivedKey.toString("hex")}`;
+    return `scrypt:${salt}:${derivedKey.toString('hex')}`;
   }
 
-  async verifyPassword(password: string, passwordHash: string): Promise<boolean> {
-    const [algorithm, salt, key] = passwordHash.split(":");
-    if (algorithm !== "scrypt" || !salt || !key) return false;
+  private async verifyPassword(password: string, passwordHash: string): Promise<boolean> {
+    const [algorithm, salt, key] = passwordHash.split(':');
+    if (algorithm !== 'scrypt' || !salt || !key) return false;
 
     const derivedKey = (await scrypt(password, salt, PASSWORD_KEY_LENGTH)) as Buffer;
-    const storedKey = Buffer.from(key, "hex");
+    const storedKey = Buffer.from(key, 'hex');
 
     return storedKey.length === derivedKey.length && timingSafeEqual(storedKey, derivedKey);
   }
 
-  private async logSecurityEvent(action: string, userId: string | null | undefined, meta: RequestMeta) {
-    await this.securityEvents.log({ userId, action, ip: meta.ip, userAgent: meta.userAgent });
+  private async revokeFamily(familyId: string) {
+    await this.prisma.refreshToken.updateMany({
+      where: { familyId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  private sanitizeUser(user: User): AuthUser {
+    const { passwordHash, webhookSecret, ...safeUser } = user;
+    return safeUser;
+  }
+
+  private async logSecurityEvent(
+    action: SecurityEventAction,
+    userId: string | null | undefined,
+    meta: RequestMeta,
+  ) {
+    await this.securityEvents.log({
+      userId,
+      action,
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+    });
   }
 
   private async handleFailedLogin(userId: string | undefined, meta: RequestMeta) {
-    if (!userId) { await this.logSecurityEvent(ACTION_LOGIN_FAILURE, null, meta); return; }
+    if (!userId) {
+      await this.logSecurityEvent(SecurityEventAction.LOGIN_FAILURE, null, meta);
+      return;
+    }
 
-    await this.logSecurityEvent(ACTION_LOGIN_FAILURE, userId, meta);
+    await this.logSecurityEvent(SecurityEventAction.LOGIN_FAILURE, userId, meta);
+
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) return;
 
@@ -439,14 +732,258 @@ export class AuthService {
 
     if (newFailedAttempts >= MAX_FAILED_ATTEMPTS) {
       const lockedUntil = new Date(Date.now() + LOCKOUT_DURATION_MINUTES * 60 * 1000);
-      await this.prisma.user.update({ where: { id: userId }, data: { failedLoginAttempts: newFailedAttempts, lockedUntil } });
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          failedLoginAttempts: newFailedAttempts,
+          lockedUntil,
+        },
+      });
       this.logger.warn(`Account locked: ${user.email} after ${newFailedAttempts} failed attempts`);
     } else {
-      await this.prisma.user.update({ where: { id: userId }, data: { failedLoginAttempts: newFailedAttempts } });
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          failedLoginAttempts: newFailedAttempts,
+        },
+      });
     }
   }
 
   private async resetFailedAttempts(userId: string) {
-    await this.prisma.user.update({ where: { id: userId }, data: { failedLoginAttempts: 0, lockedUntil: null } });
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+  }
+
+  // ---------------------- WebAuthn (Passkeys) ----------------------
+
+  /**
+   * Change password for authenticated user (requires current password).
+   */
+  async resetPassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new BadRequestException('User not found');
+    if (!user.passwordHash) throw new BadRequestException('Account does not use password authentication');
+
+    const valid = await this.verifyPassword(currentPassword, user.passwordHash);
+    if (!valid) throw new UnauthorizedException('Current password is incorrect');
+
+    this.passwordPolicy.validate(newPassword);
+    const newHash = await this.hashPassword(newPassword);
+    await this.prisma.user.update({ where: { id: userId }, data: { passwordHash: newHash } });
+  }
+
+  /**
+   * Verify a Stellar ed25519 wallet signature over a nonce string.
+   * Used by GdprService to re-authenticate a user before sensitive operations.
+   *
+   * @param stellarAddress - G... public key of the signer
+   * @param nonce          - The raw challenge string that was signed
+   * @param signature      - Hex or base64 encoded signature produced by the wallet
+   * @returns true if the signature is valid for this address + nonce, false otherwise
+   */
+  verifyWalletSignature(stellarAddress: string, nonce: string, signature: string): boolean {
+    try {
+      const keypair = Keypair.fromPublicKey(stellarAddress);
+      const messageBytes = Buffer.from(nonce, 'utf8');
+      // Accept both hex and base64 encoded signatures from wallet clients
+      const sigBytes = signature.includes('=') || /^[a-zA-Z0-9+/]+=*$/.test(signature)
+        ? Buffer.from(signature, 'base64')
+        : Buffer.from(signature, 'hex');
+      return keypair.verify(messageBytes, sigBytes);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verify a plain-text password against a stored hash (used by GdprService for re-authentication).
+   */
+  async checkPassword(plain: string, hash: string): Promise<boolean> {
+    return this.verifyPassword(plain, hash);
+  }
+
+  /**
+   * Generate registration options for a user identified by stellarAddress.
+   * Creates the user if not present. Stores the challenge in memory keyed by user.id.
+   */
+  async generateWebauthnRegistrationOptions(stellarAddress: string) {
+    if (!stellarAddress) throw new BadRequestException('stellarAddress is required');
+
+    const user = await this.prisma.user.upsert({
+      where: { stellarAddress },
+      create: { stellarAddress },
+      update: {},
+    });
+
+    const rpName = this.config.get<string>('WEBAUTHN_RP_NAME', 'HireSettle');
+    const rpID = this.config.get<string>('WEBAUTHN_RP_ID', this.config.get<string>('HOST') || 'localhost');
+
+    const options = generateRegistrationOptions({
+      rpName,
+      rpID,
+      userID: user.id,
+      userName: user.stellarAddress,
+      attestationType: 'none',
+      authenticatorSelection: {
+        userVerification: 'required', // require UV for phishing resistance
+      },
+      // prevent re-registration of same credential IDs on client side
+      excludeCredentials: [],
+    });
+
+    // store challenge keyed by user id
+    this.regChallenges.set(user.id, options.challenge);
+
+    return { options, userId: user.id };
+  }
+
+  /**
+   * Verify attestation response from client and persist credential.
+   */
+  async verifyWebauthnRegistration(dto: { stellarAddress: string; attestationResponse: any }) {
+    const { stellarAddress, attestationResponse } = dto;
+    if (!stellarAddress || !attestationResponse) throw new BadRequestException('Missing fields');
+
+    const user = await this.prisma.user.findUnique({ where: { stellarAddress } });
+    if (!user) throw new BadRequestException('User not found');
+
+    const expectedChallenge = this.regChallenges.get(user.id);
+    if (!expectedChallenge) throw new BadRequestException('No registration in progress for this user');
+
+    const origin = this.config.get<string>('ORIGIN', `http://localhost:3000`);
+    const rpID = this.config.get<string>('WEBAUTHN_RP_ID', this.config.get<string>('HOST') || 'localhost');
+
+    let verification;
+    try {
+      verification = await verifyRegistrationResponse({
+        response: attestationResponse,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+      });
+    } catch (err) {
+      this.logger.error('Registration verification failed', err as any);
+      throw new BadRequestException('Registration verification failed');
+    }
+
+    const { verified, registrationInfo } = verification as any;
+    if (!verified || !registrationInfo) {
+      throw new BadRequestException('Could not verify registration');
+    }
+
+    const credentialId = Buffer.from(registrationInfo.credentialID).toString('base64url');
+    const publicKey = registrationInfo.credentialPublicKey; // Buffer — store as base64
+    const counter = registrationInfo.counter ?? 0;
+
+    // Persist credential
+    await (this.prisma as any).credential.create({
+      data: {
+        userId: user.id,
+        credentialId,
+        publicKey: Buffer.isBuffer(publicKey) ? publicKey.toString('base64') : String(publicKey),
+        counter: Number(counter),
+        transports: Array.isArray(attestationResponse.transports) ? attestationResponse.transports.join(',') : undefined,
+      },
+    });
+
+    // Cleanup
+    this.regChallenges.delete(user.id);
+
+    return { ok: true };
+  }
+
+  /**
+   * Generate authentication (assertion) options for a user.
+   */
+  async generateWebauthnAuthenticationOptions(stellarAddress: string) {
+    if (!stellarAddress) throw new BadRequestException('stellarAddress is required');
+
+    const user = await this.prisma.user.findUnique({ where: { stellarAddress } });
+    if (!user) throw new BadRequestException('User not found');
+
+    const creds = await (this.prisma as any).credential.findMany({ where: { userId: user.id } });
+
+    const rpID = this.config.get<string>('WEBAUTHN_RP_ID', this.config.get<string>('HOST') || 'localhost');
+
+    const allowCredentials = creds.map((c) => ({
+      id: Buffer.from(c.credentialId, 'base64url'),
+      type: 'public-key' as const,
+      transports: c.transports ? c.transports.split(',') : undefined,
+    }));
+
+    const options = generateAuthenticationOptions({
+      allowCredentials,
+      userVerification: 'required',
+      rpID,
+    });
+
+    this.authChallenges.set(user.id, options.challenge);
+
+    return { options, userId: user.id };
+  }
+
+  /**
+   * Verify assertion response and issue JWT on success.
+   */
+  async verifyWebauthnAuthentication(dto: { stellarAddress: string; assertionResponse: any }) {
+    const { stellarAddress, assertionResponse } = dto;
+    if (!stellarAddress || !assertionResponse) throw new BadRequestException('Missing fields');
+
+    const user = await this.prisma.user.findUnique({ where: { stellarAddress } });
+    if (!user) throw new BadRequestException('User not found');
+
+    const expectedChallenge = this.authChallenges.get(user.id);
+    if (!expectedChallenge) throw new BadRequestException('No authentication in progress for this user');
+
+    // find credential
+    const credential = await (this.prisma as any).credential.findUnique({ where: { credentialId: Buffer.from(assertionResponse.id, 'base64').toString('base64url') } });
+    if (!credential) throw new BadRequestException('Unknown credential');
+
+    const origin = this.config.get<string>('ORIGIN', `http://localhost:3000`);
+    const rpID = this.config.get<string>('WEBAUTHN_RP_ID', this.config.get<string>('HOST') || 'localhost');
+
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: assertionResponse,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        authenticator: {
+          credentialPublicKey: Buffer.from(credential.publicKey, 'base64'),
+          credentialID: Buffer.from(credential.credentialId, 'base64url'),
+          counter: credential.counter,
+        },
+      } as any);
+    } catch (err) {
+      this.logger.error('Authentication verification failed', err as any);
+      throw new BadRequestException('Authentication verification failed');
+    }
+
+    const { verified, authenticationInfo } = verification as any;
+    if (!verified) throw new BadRequestException('Assertion not verified');
+
+    // Update counter
+    if (authenticationInfo && typeof authenticationInfo.newCounter === 'number') {
+      await (this.prisma as any).credential.update({ where: { id: credential.id }, data: { counter: Number(authenticationInfo.newCounter) } });
+    }
+
+    // Cleanup
+    this.authChallenges.delete(user.id);
+
+    // Issue JWT similarly to existing login flow
+    const accessToken = this.jwt.sign({
+      sub: user.id,
+      stellarAddress: user.stellarAddress,
+      role: user.role,
+    });
+
+    return { accessToken, user };
   }
 }

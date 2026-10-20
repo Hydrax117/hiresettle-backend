@@ -135,7 +135,7 @@ export class CreditLedgerService {
       };
     });
 
-    const creditApplied = entry ? -entry.amount : 0n;
+    const creditApplied = entry ? BigInt(-entry.amount) : 0n;
     return {
       feeAmount,
       creditApplied,

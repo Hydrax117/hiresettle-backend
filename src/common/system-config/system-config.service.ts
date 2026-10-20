@@ -90,6 +90,10 @@ export class SystemConfigService implements OnModuleInit, OnModuleDestroy {
     const next = new Map<string, Override>();
     for (const row of rows) {
       const definition = SYSTEM_CONFIG_DEFINITION_MAP.get(row.key);
+      if (!definition) {
+        this.logger.warn(`Ignoring unknown config key ${row.key}`);
+        continue;
+      }
       const value = parseSystemConfigValue(definition, row.value);
       if (value === undefined) {
         this.logger.warn(`Ignoring invalid stored value for ${row.key}: ${row.value}`);

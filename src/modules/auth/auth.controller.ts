@@ -14,6 +14,7 @@ import { UpdateProfileDto } from './dto/update-profile.dto';
 import { RevokeSessionDto } from './dto/revoke-session.dto';
 import { EnableTotpDto, DisableTotpDto, RegenerateRecoveryCodesDto } from './dto/totp.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { RegisterDto } from './dto/register.dto';
 import { RateLimit } from '../../common/decorators/throttle.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { LoginHistoryDto } from './dto/login-history.dto';

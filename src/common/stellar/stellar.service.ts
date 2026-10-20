@@ -18,7 +18,6 @@ import {
 } from "@stellar/stellar-sdk";
 import { StellarError, StellarErrorCode } from "./stellar.error";
 import { CacheService } from "../cache/cache.service";
-import { HorizonFailoverService } from "./horizon-failover.service";
 
 /**
  * StellarService
@@ -42,15 +41,15 @@ export interface TokenConfig {
 }
 
 interface StellarRuntimeConfig {
-  network: "testnet" | "mainnet";
+  network: 'testnet' | 'mainnet';
   rpcUrl: string;
   horizonUrl: string;
   networkPassphrase: string;
   contractAddress?: string;
 }
 
-const DEFAULT_EXPECTED_CONTRACT_VERSION = "1";
-const CONTRACT_VERSION_METHOD = "version";
+const DEFAULT_EXPECTED_CONTRACT_VERSION = '1';
+const CONTRACT_VERSION_METHOD = 'version';
 
 @Injectable()
 export class StellarService implements OnModuleInit {
@@ -59,6 +58,7 @@ export class StellarService implements OnModuleInit {
   private rpcClient: SorobanRpc.Server;
   private networkName: string;
   private networkPassphrase: string;
+  private horizonUrl: string;
   private contractId: string;
   private backendKeypair: Keypair;
   private allowedTokens: TokenConfig[];
@@ -67,76 +67,61 @@ export class StellarService implements OnModuleInit {
   constructor(
     private readonly config: ConfigService,
     private readonly cache: CacheService,
-    private readonly horizonFailover: HorizonFailoverService,
   ) {}
 
   async onModuleInit() {
     const stellarConfig =
-      this.config.get<StellarRuntimeConfig>("stellar") ??
+      this.config.get<StellarRuntimeConfig>('stellar') ??
       ({} as StellarRuntimeConfig);
 
     this.networkName = stellarConfig.network;
+    this.horizonUrl = stellarConfig.horizonUrl;
     this.networkPassphrase = stellarConfig.networkPassphrase;
-    this.contractId = stellarConfig.contractAddress;
-    this.rpcClient = new SorobanRpc.Server(stellarConfig.rpcUrl, {
-      allowHttp: true,
-    });
+    this.contractId = stellarConfig.contractAddress ?? '';
+    this.rpcClient = new SorobanRpc.Server(stellarConfig.rpcUrl, { allowHttp: true });
 
     // Parse allowed tokens from config
     try {
-      const allowedTokensJson = this.config.get<string>("ALLOWED_TOKENS", "[]");
+      const allowedTokensJson = this.config.get<string>('ALLOWED_TOKENS', '[]');
       this.allowedTokens = JSON.parse(allowedTokensJson);
     } catch (e) {
-      this.logger.error("Failed to parse ALLOWED_TOKENS from config", e);
+      this.logger.error('Failed to parse ALLOWED_TOKENS from config', e);
       this.allowedTokens = [];
     }
 
-    const secretKey = this.config.get<string>("STELLAR_SECRET_KEY");
+    const secretKey = this.config.get<string>('STELLAR_SECRET_KEY');
     if (secretKey) {
       this.backendKeypair = Keypair.fromSecret(secretKey);
     }
 
     this.logger.log(`Active Stellar network: ${this.networkName}`);
     this.logger.log(`Stellar RPC: ${stellarConfig.rpcUrl}`);
-    this.logger.log(
-      `Stellar Horizon (active): ${this.horizonFailover.activeUrl}`,
-    );
+    this.logger.log(`Stellar Horizon: ${this.horizonUrl}`);
     this.logger.log(`Contract: ${this.contractId}`);
-    this.logger.log(
-      `Allowed tokens: ${this.allowedTokens.map((t) => `${t.symbol} (${t.address})`).join(", ")}`,
-    );
+    this.logger.log(`Allowed tokens: ${this.allowedTokens.map(t => `${t.symbol} (${t.address})`).join(', ')}`);
 
     await this.checkContractCompatibility();
   }
 
   private async checkContractCompatibility(): Promise<void> {
-    const skip = this.config.get<boolean | string>(
-      "SKIP_CONTRACT_COMPATIBILITY_CHECK",
-      false,
-    );
-    if (
-      skip === true ||
-      ["true", "1", "yes"].includes(String(skip).toLowerCase())
-    ) {
+    const skip = this.config.get<boolean | string>('SKIP_CONTRACT_COMPATIBILITY_CHECK', false);
+    if (skip === true || ['true', '1', 'yes'].includes(String(skip).toLowerCase())) {
       this.logger.warn(
-        "Skipping Soroban contract compatibility check; use only with a local mock contract",
+        'Skipping Soroban contract compatibility check; use only with a local mock contract',
       );
       return;
     }
 
     const expectedVersion = this.config.get<string>(
-      "HIRESETTLE_CONTRACT_VERSION",
+      'HIRESETTLE_CONTRACT_VERSION',
       DEFAULT_EXPECTED_CONTRACT_VERSION,
     );
 
     try {
-      const version = await this.simulateContractCall(
-        CONTRACT_VERSION_METHOD,
-        [],
-      );
+      const version = await this.simulateContractCall(CONTRACT_VERSION_METHOD, []);
       const actualVersion =
-        typeof version === "object" && version !== null
-          ? (version.version ?? version.contract_version)
+        typeof version === 'object' && version !== null
+          ? version.version ?? version.contract_version
           : version;
 
       if (String(actualVersion) !== expectedVersion) {
@@ -146,14 +131,12 @@ export class StellarService implements OnModuleInit {
         );
       }
 
-      this.logger.log(
-        `Soroban contract compatibility verified (version ${expectedVersion})`,
-      );
+      this.logger.log(`Soroban contract compatibility verified (version ${expectedVersion})`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
         `Soroban contract compatibility check failed for ${this.contractId}: ${message}. ` +
-          "Set SKIP_CONTRACT_COMPATIBILITY_CHECK=true only for local mock development.",
+          'Set SKIP_CONTRACT_COMPATIBILITY_CHECK=true only for local mock development.',
       );
     }
   }
@@ -169,7 +152,7 @@ export class StellarService implements OnModuleInit {
     return this.networkPassphrase;
   }
   getHorizonUrl(): string {
-    return this.horizonFailover.activeUrl;
+    return this.horizonUrl;
   }
   getContractId(): string {
     return this.contractId;
@@ -214,7 +197,7 @@ export class StellarService implements OnModuleInit {
     const result = await this.rpcClient.getEvents({
       startLedger,
       endLedger,
-      filters: [{ type: "contract", contractIds: [this.contractId] }],
+      filters: [{ type: 'contract', contractIds: [this.contractId] }],
       limit: 100,
     } as any);
     return result.events ?? [];
@@ -462,7 +445,7 @@ export class StellarService implements OnModuleInit {
     const keypair = signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
@@ -479,7 +462,7 @@ export class StellarService implements OnModuleInit {
     prepared.sign(keypair);
 
     const sendResult = await this.rpcClient.sendTransaction(prepared);
-    if (sendResult.status === "ERROR") {
+    if (sendResult.status === 'ERROR') {
       throw new StellarError(
         `Transaction submission failed: ${sendResult.errorResult}`,
         StellarErrorCode.SUBMISSION_FAILED,
@@ -491,23 +474,16 @@ export class StellarService implements OnModuleInit {
     let getResult: SorobanRpc.Api.GetTransactionResponse;
 
     do {
-      await new Promise((r) =>
-        setTimeout(r, StellarService.TX_POLL_INTERVAL_MS),
-      );
+      await new Promise((r) => setTimeout(r, StellarService.TX_POLL_INTERVAL_MS));
       getResult = await this.rpcClient.getTransaction(sendResult.hash);
-      if (
-        Date.now() > deadline &&
-        getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND
-      ) {
+      if (Date.now() > deadline && getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
         throw new StellarError(
           `Transaction not confirmed within 30 s (hash: ${sendResult.hash})`,
           StellarErrorCode.CONFIRMATION_TIMEOUT,
           sendResult.hash,
         );
       }
-    } while (
-      getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND
-    );
+    } while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND);
 
     if (getResult.status !== SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       throw new StellarError(
@@ -542,13 +518,13 @@ export class StellarService implements OnModuleInit {
     const keypair = params.signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
 
     const contract = new Contract(this.contractId);
-    let account: Awaited<ReturnType<SorobanRpc.Server["getAccount"]>>;
+    let account: Awaited<ReturnType<SorobanRpc.Server['getAccount']>>;
     try {
       account = await this.rpcClient.getAccount(keypair.publicKey());
     } catch (err) {
@@ -575,13 +551,13 @@ export class StellarService implements OnModuleInit {
     })
       .addOperation(
         contract.call(
-          "create_engagement",
-          nativeToScVal(params.engagementId, { type: "string" }),
-          nativeToScVal(params.companyAddress, { type: "address" }),
-          nativeToScVal(params.recruiterAddress, { type: "address" }),
-          nativeToScVal(params.arbiterAddress, { type: "address" }),
-          nativeToScVal(params.tokenAddress, { type: "address" }),
-          nativeToScVal(BigInt(params.totalAmount), { type: "i128" }),
+          'create_engagement',
+          nativeToScVal(params.engagementId, { type: 'string' }),
+          nativeToScVal(params.companyAddress, { type: 'address' }),
+          nativeToScVal(params.recruiterAddress, { type: 'address' }),
+          nativeToScVal(params.arbiterAddress, { type: 'address' }),
+          nativeToScVal(params.tokenAddress, { type: 'address' }),
+          nativeToScVal(BigInt(params.totalAmount), { type: 'i128' }),
           milestonesScVal,
         ),
       )
@@ -604,7 +580,7 @@ export class StellarService implements OnModuleInit {
     const keypair = signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
@@ -618,9 +594,9 @@ export class StellarService implements OnModuleInit {
     })
       .addOperation(
         contract.call(
-          "unlock_retention_milestone",
-          nativeToScVal(engagementId, { type: "string" }),
-          nativeToScVal(milestoneIndex, { type: "u32" }),
+          'unlock_retention_milestone',
+          nativeToScVal(engagementId, { type: 'string' }),
+          nativeToScVal(milestoneIndex, { type: 'u32' }),
         ),
       )
       .setTimeout(60)
@@ -651,7 +627,7 @@ export class StellarService implements OnModuleInit {
     const keypair = signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
@@ -665,53 +641,9 @@ export class StellarService implements OnModuleInit {
     })
       .addOperation(
         contract.call(
-          "release_milestone_payment",
-          nativeToScVal(engagementId, { type: "string" }),
-          nativeToScVal(milestoneIndex, { type: "u32" }),
-        ),
-      )
-      .setTimeout(60)
-      .build();
-
-    const { txHash } = await this.submitAndConfirm(tx, signer);
-    return txHash;
-  }
-
-  /**
-   * Release part of a milestone's escrow to the recruiter (#378). The
-   * remainder is refunded to the company when `refundRemainder` is true,
-   * otherwise it stays in escrow on the milestone.
-   * Returns tx hash on confirmation; throws StellarError on failure.
-   */
-  async releasePartialMilestonePayment(
-    engagementId: string,
-    milestoneIndex: number,
-    releaseAmount: bigint,
-    refundRemainder: boolean,
-    signer?: Keypair,
-  ): Promise<string> {
-    const keypair = signer ?? this.backendKeypair;
-    if (!keypair) {
-      throw new StellarError(
-        "Backend Stellar keypair is not configured",
-        StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
-      );
-    }
-
-    const contract = new Contract(this.contractId);
-    const account = await this.rpcClient.getAccount(keypair.publicKey());
-
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        contract.call(
-          "release_partial_payment",
-          nativeToScVal(engagementId, { type: "string" }),
-          nativeToScVal(milestoneIndex, { type: "u32" }),
-          nativeToScVal(releaseAmount, { type: "i128" }),
-          nativeToScVal(refundRemainder, { type: "bool" }),
+          'release_milestone_payment',
+          nativeToScVal(engagementId, { type: 'string' }),
+          nativeToScVal(milestoneIndex, { type: 'u32' }),
         ),
       )
       .setTimeout(60)
@@ -732,7 +664,7 @@ export class StellarService implements OnModuleInit {
     const keypair = signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
@@ -746,8 +678,8 @@ export class StellarService implements OnModuleInit {
     })
       .addOperation(
         contract.call(
-          "cancel_engagement",
-          nativeToScVal(engagementId, { type: "string" }),
+          'cancel_engagement',
+          nativeToScVal(engagementId, { type: 'string' }),
         ),
       )
       .setTimeout(60)
@@ -770,7 +702,7 @@ export class StellarService implements OnModuleInit {
     const keypair = signer ?? this.backendKeypair;
     if (!keypair) {
       throw new StellarError(
-        "Backend Stellar keypair is not configured",
+        'Backend Stellar keypair is not configured',
         StellarErrorCode.KEYPAIR_NOT_CONFIGURED,
       );
     }
@@ -784,10 +716,10 @@ export class StellarService implements OnModuleInit {
     })
       .addOperation(
         contract.call(
-          "resolve_dispute",
-          nativeToScVal(engagementId, { type: "string" }),
-          nativeToScVal(milestoneIndex, { type: "u32" }),
-          nativeToScVal(approved, { type: "bool" }),
+          'resolve_dispute',
+          nativeToScVal(engagementId, { type: 'string' }),
+          nativeToScVal(milestoneIndex, { type: 'u32' }),
+          nativeToScVal(approved, { type: 'bool' }),
         ),
       )
       .setTimeout(60)
@@ -813,12 +745,12 @@ export class StellarService implements OnModuleInit {
 
   /** Check if a token address is in the allowlist */
   isTokenAllowed(tokenAddress: string): boolean {
-    return this.allowedTokens.some((t) => t.address === tokenAddress);
+    return this.allowedTokens.some(t => t.address === tokenAddress);
   }
 
   /** Get token config by address, throws if not allowed */
   getTokenConfig(tokenAddress: string): TokenConfig {
-    const config = this.allowedTokens.find((t) => t.address === tokenAddress);
+    const config = this.allowedTokens.find(t => t.address === tokenAddress);
     if (!config) {
       throw new BadRequestException(`Token ${tokenAddress} is not allowed`);
     }
@@ -846,7 +778,7 @@ export class StellarService implements OnModuleInit {
     const address = this.getBackendAccountAddress();
     if (!address) return 0n;
 
-    const { balance } = await this.getBalance(address, "native");
+    const { balance } = await this.getBalance(address, 'native');
     return balance;
   }
 
@@ -861,10 +793,9 @@ export class StellarService implements OnModuleInit {
     try {
       const isNative = tokenAddress === "native" || tokenAddress === "XLM";
       if (!isNative) this.getTokenConfig(tokenAddress);
-      const response = await this.horizonFailover.fetch(
-        `/accounts/${accountAddress}`,
-      );
+      const response = await fetch(`${this.horizonUrl}/accounts/${accountAddress}`);
       if (!response.ok) {
+        // For balance endpoint and validations we want a hard failure.
         throw new BadRequestException(
           `Stellar account not found or not accessible: ${accountAddress}`,
         );
@@ -906,34 +837,26 @@ export class StellarService implements OnModuleInit {
   }
 
   /** Convert stroops (i128 as string/bigint) to human-readable amount */
-  stroopsToHuman(
-    stroops: string | bigint,
-    tokenAddress: string,
-    decimalsOverride?: number,
-  ): string {
-    const config = decimalsOverride
-      ? { decimals: decimalsOverride }
-      : this.getTokenConfig(tokenAddress);
+  stroopsToHuman(stroops: string | bigint, tokenAddress: string, decimalsOverride?: number): string {
+    const config = decimalsOverride ? { decimals: decimalsOverride } : this.getTokenConfig(tokenAddress);
     const value = BigInt(stroops);
     const divisor = BigInt(10) ** BigInt(config.decimals);
     const whole = value / divisor;
-    const fraction = (value % divisor)
-      .toString()
-      .padStart(config.decimals, "0");
+    const fraction = (value % divisor).toString().padStart(config.decimals, '0');
     return parseFloat(`${whole}.${fraction}`).toFixed(config.decimals);
   }
 
   /** Convert human-readable amount to stroops */
   humanToStroops(human: string, tokenOrDecimals: string | number): bigint {
     let decimals: number;
-    if (typeof tokenOrDecimals === "string") {
+    if (typeof tokenOrDecimals === 'string') {
       const config = this.getTokenConfig(tokenOrDecimals);
       decimals = config.decimals;
     } else {
       decimals = tokenOrDecimals;
     }
-    const [whole, fraction = ""] = human.split(".");
-    const paddedFraction = fraction.padEnd(decimals, "0").slice(0, decimals);
+    const [whole, fraction = ''] = human.split('.');
+    const paddedFraction = fraction.padEnd(decimals, '0').slice(0, decimals);
     const divisor = BigInt(10) ** BigInt(decimals);
     return BigInt(whole) * divisor + BigInt(paddedFraction);
   }
@@ -943,7 +866,7 @@ export class StellarService implements OnModuleInit {
     const divisor = BigInt(10) ** BigInt(7);
     const value = BigInt(stroops);
     const whole = value / divisor;
-    const fraction = (value % divisor).toString().padStart(7, "0");
+    const fraction = (value % divisor).toString().padStart(7, '0');
     return parseFloat(`${whole}.${fraction}`).toFixed(decimals);
   }
 
@@ -969,9 +892,7 @@ export class StellarService implements OnModuleInit {
     requireFunded = true,
   ): Promise<boolean> {
     try {
-      const response = await this.horizonFailover.fetch(
-        `/accounts/${accountAddress}`,
-      );
+      const response = await fetch(`${this.horizonUrl}/accounts/${accountAddress}`);
       if (!response.ok) return false;
       if (!requireFunded) return true;
 
@@ -1002,11 +923,8 @@ export class StellarService implements OnModuleInit {
    * @returns { baseFee: number, sorobanFee: number } in stroops
    */
   async getFeeEstimate(): Promise<{ baseFee: number; sorobanFee: number }> {
-    const CACHE_KEY = "stellar:fee_estimate";
-    const cached = await this.cache.get<{
-      baseFee: number;
-      sorobanFee: number;
-    }>(CACHE_KEY);
+    const CACHE_KEY = 'stellar:fee_estimate';
+    const cached = await this.cache.get<{ baseFee: number; sorobanFee: number }>(CACHE_KEY);
     if (cached) return cached;
 
     await this.rpcClient.getLatestLedger();
@@ -1015,93 +933,5 @@ export class StellarService implements OnModuleInit {
     const result = { baseFee, sorobanFee };
     await this.cache.set(CACHE_KEY, result, 10); // 10 s TTL
     return result;
-  }
-
-  // ----------------------------------------------------------
-  // SIGNATURE VERIFICATION (#357 — wallet rebinding)
-  // ----------------------------------------------------------
-
-  /**
-   * Verify that `signature` is a valid Ed25519 signature of `message`
-   * produced by the private key that corresponds to `stellarAddress`.
-   *
-   * The Stellar SDK's Keypair.verify() expects:
-   *   - data:      Buffer of the raw message bytes
-   *   - signature: Buffer of the 64-byte raw signature
-   *
-   * Clients must base64-encode the 64-byte signature before sending it.
-   */
-  verifySignature(
-    stellarAddress: string,
-    message: string,
-    signatureBase64: string,
-  ): boolean {
-    try {
-      const keypair = Keypair.fromPublicKey(stellarAddress);
-      const messageBuffer = Buffer.from(message, "utf8");
-      const signatureBuffer = Buffer.from(signatureBase64, "base64");
-      return keypair.verify(messageBuffer, signatureBuffer);
-    } catch {
-      return false;
-    }
-  }
-
-  // ----------------------------------------------------------
-  // MULTISIG ESCROW SUBMISSION (#495)
-  // ----------------------------------------------------------
-
-  /**
-   * Extracts the decorated signature(s) a signer added to their own copy of
-   * a transaction envelope, so they can be collected and combined onto a
-   * single base envelope once a signer-set's threshold is met.
-   */
-  extractSignatures(signedXdr: string): xdr.DecoratedSignature[] {
-    const tx = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
-    if (!(tx instanceof Transaction)) {
-      throw new StellarError(
-        "Fee-bump transactions are not supported for multisig signature collection",
-        StellarErrorCode.SUBMISSION_FAILED,
-      );
-    }
-    return tx.signatures;
-  }
-
-  /**
-   * Combines the unsigned base envelope with a set of previously-collected
-   * decorated signatures and submits the result to Horizon. This is called
-   * only once the app-level threshold gate (see MultisigService) confirms
-   * enough distinct signers have signed, so it never wastes a submission
-   * attempt on an under-signed transaction.
-   */
-  async submitMultisigTransaction(
-    unsignedXdr: string,
-    signatures: xdr.DecoratedSignature[],
-  ): Promise<{ txHash: string }> {
-    const tx = TransactionBuilder.fromXDR(unsignedXdr, this.networkPassphrase);
-    if (!(tx instanceof Transaction)) {
-      throw new StellarError(
-        "Fee-bump transactions are not supported for multisig submission",
-        StellarErrorCode.SUBMISSION_FAILED,
-      );
-    }
-    for (const sig of signatures) {
-      tx.signatures.push(sig);
-    }
-
-    const response = await this.horizonFailover.fetch("/transactions", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `tx=${encodeURIComponent(tx.toXDR())}`,
-    });
-
-    const body: any = await response.json();
-    if (!response.ok) {
-      throw new StellarError(
-        `Multisig transaction submission failed: ${JSON.stringify(body)}`,
-        StellarErrorCode.SUBMISSION_FAILED,
-      );
-    }
-
-    return { txHash: body.hash };
   }
 }

@@ -148,7 +148,7 @@ describe('EngagementFieldsResolver DataLoaders (#515)', () => {
     const userBatch = userBatches.find((keys) => !keys[0].startsWith('GCOMPANY'));
     expect(companyBatch).toHaveLength(10);
     expect(userBatch).toHaveLength(6); // 5 recruiters + 1 arbiter
-    expect(new Set(userBatch).size).toBe(userBatch.length);
+    expect(new Set(userBatch!).size).toBe(userBatch!.length);
 
     const milestoneBatch = (prisma.milestone.findMany.mock.calls[0] as any)[0].where.engagementId.in;
     expect(milestoneBatch).toHaveLength(ENGAGEMENT_COUNT);
@@ -160,9 +160,9 @@ describe('EngagementFieldsResolver DataLoaders (#515)', () => {
     const result = await resolveEngagementList(prisma);
 
     for (const engagement of result) {
-      expect(engagement.company.stellarAddress).toBe(engagement.companyAddress);
-      expect(engagement.recruiter.stellarAddress).toBe(engagement.recruiterAddress);
-      expect(engagement.arbiter.stellarAddress).toBe('GARBITER');
+      expect(engagement.company!.stellarAddress).toBe(engagement.companyAddress);
+      expect(engagement.recruiter!.stellarAddress).toBe(engagement.recruiterAddress);
+      expect(engagement.arbiter!.stellarAddress).toBe('GARBITER');
       expect(engagement.milestones.map((m) => m.milestoneIndex)).toEqual([0, 1]);
       expect(engagement.milestones.every((m) => m.id.startsWith(`${engagement.id}-`))).toBe(true);
       expect(engagement.milestones[0].amount).toBe('500000');

@@ -23,10 +23,11 @@ export class RetentionSchedulerService {
       const milestones = await this.milestonesService.findActiveRetentionMilestones();
 
       for (const milestone of milestones) {
-        if (currentLedger >= milestone.validAfterLedger) {
+        if (milestone.validAfterLedger !== null && currentLedger >= milestone.validAfterLedger) {
           await this.milestonesService.unlockRetentionOnChain(milestone.id);
           this.logger.log(`Automatically unlocked mature milestone ID: ${milestone.id}`);
         } else if (
+          milestone.validAfterLedger !== null &&
           milestone.validAfterLedger - currentLedger <= THREE_DAYS_IN_LEDGERS &&
           !milestone.approachingNotificationSent
         ) {

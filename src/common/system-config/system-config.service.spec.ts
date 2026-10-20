@@ -59,7 +59,7 @@ describe('SystemConfigService (#503)', () => {
 
     expect(view).toMatchObject({ value: 96, source: 'override' });
     expect(service.getNumber('disputes.slaReviewHours')).toBe(96);
-    expect(rows.get('disputes.slaReviewHours').value).toBe('96');
+    expect(rows.get('disputes.slaReviewHours')!.value).toBe('96');
     expect(auditLogs).toEqual([
       {
         entityType: 'SystemConfig',

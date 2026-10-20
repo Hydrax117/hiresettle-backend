@@ -1,6 +1,7 @@
 import {
   Injectable, NotFoundException, ForbiddenException, BadRequestException,
 } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { CreateEngagementTemplateDto } from './dto/create-engagement-template.dto';
 import { UpdateEngagementTemplateDto } from './dto/update-engagement-template.dto';
@@ -33,7 +34,7 @@ export class EngagementTemplatesService {
           jobDescription: template.jobDescription,
           salaryRange: template.salaryRange,
           location: template.location,
-          milestoneConfig: template.milestoneConfig,
+          milestoneConfig: template.milestoneConfig as Prisma.InputJsonValue,
         },
       });
 

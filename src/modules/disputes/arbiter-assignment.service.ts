@@ -45,7 +45,7 @@ export class ArbiterAssignmentService {
       where: { engagementId: engagement.id },
       select: { arbiterId: true },
     });
-    const conflicted = new Set(recusals.map((r) => r.arbiterId));
+    const conflicted = new Set<string>(recusals.map((r) => r.arbiterId as string));
     if (engagement.companyId) conflicted.add(engagement.companyId);
     if (engagement.recruiterId) conflicted.add(engagement.recruiterId);
     return conflicted;
@@ -82,7 +82,7 @@ export class ArbiterAssignmentService {
 
     let best: ArbiterCandidate | null = null;
     for (const arbiter of eligible) {
-      const activeDisputes = loadById.get(arbiter.id) ?? 0;
+      const activeDisputes: number = (loadById.get(arbiter.id) as number | undefined) ?? 0;
       if (!best || activeDisputes < best.activeDisputes) best = { ...arbiter, activeDisputes };
     }
     return best;

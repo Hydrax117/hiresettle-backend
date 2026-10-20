@@ -82,10 +82,10 @@ export class JobsService {
 
     switch (target.kind) {
       case 'bullmq-scheduler':
-        await this.queue(target.queue).removeJobScheduler(target.id);
+        await this.queue(target.queue!).removeJobScheduler(target.id);
         break;
       case 'bullmq-delayed': {
-        const job = await this.queue(target.queue).getJob(target.id);
+        const job = await this.queue(target.queue!).getJob(target.id);
         if (!job) throw new NotFoundException(`Scheduled job "${jobKey}" not found`);
         await job.remove();
         break;
@@ -137,7 +137,7 @@ export class JobsService {
     const delayedViews: ScheduledJobView[] = delayed
       .filter((job) => job?.id && !job.repeatJobKey)
       .map((job) => ({
-        jobKey: buildJobKey('bullmq-delayed', job.id, queue.name),
+        jobKey: buildJobKey('bullmq-delayed', job.id!, queue.name),
         kind: 'bullmq-delayed',
         name: job.name,
         queue: queue.name,

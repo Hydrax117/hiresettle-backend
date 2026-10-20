@@ -137,7 +137,7 @@ export class PartialReleaseService {
       throw error;
     }
 
-    await this.audit(milestone.id, milestone.status, milestone.status, user.id, 'PARTIAL_RELEASE_PROPOSED', {
+    await this.audit(milestone.id, milestone.status, milestone.status, user.id ?? '', 'PARTIAL_RELEASE_PROPOSED', {
       releaseId: release.id,
       proposedBy: role,
       releaseAmount: split.releaseAmount.toString(),
@@ -185,7 +185,7 @@ export class PartialReleaseService {
     const updated = await this.prisma.milestonePartialRelease.findUniqueOrThrow({ where: { id: release.id } });
     if (!PartialReleaseService.hasDualApproval(updated)) return serialize(updated);
 
-    return serialize(await this.execute(updated, milestone, engagement, user.id));
+    return serialize(await this.execute(updated, milestone, engagement, user.id ?? ''));
   }
 
   async reject(engagementId: string, milestoneIndex: number, releaseId: string, user: PartyUser) {
@@ -199,7 +199,7 @@ export class PartialReleaseService {
     });
     if (!count) throw new ConflictException('This partial release is no longer open.');
 
-    await this.audit(milestone.id, milestone.status, milestone.status, user.id, 'PARTIAL_RELEASE_REJECTED', {
+    await this.audit(milestone.id, milestone.status, milestone.status, user.id ?? '', 'PARTIAL_RELEASE_REJECTED', {
       releaseId: release.id,
     });
     return serialize({ ...release, status: PartialReleaseStatus.REJECTED });

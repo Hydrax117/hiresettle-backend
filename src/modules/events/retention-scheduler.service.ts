@@ -103,6 +103,7 @@ export class RetentionSchedulerService {
 
         for (const user of users) {
           if (!this.isWithinLocalHours(user.timezone)) continue;
+          if (!user.stellarAddress) continue;
           await this.notifications.notifyUser(
             user.stellarAddress,
             NotificationType.RETENTION_WINDOW_APPROACHING,
